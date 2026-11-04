@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "session-context": {
+      "command": "python3",
+      "args": [
+        "-c",
+        "import os, runpy; runpy.run_path(os.path.expanduser('~/.gemini/config/plugins/session-context/mcp_server.py'), run_name='__main__')"
+      ]
+    }
+  }
+}

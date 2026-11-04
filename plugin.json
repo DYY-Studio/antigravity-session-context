@@ -1,0 +1,12 @@
+{
+  "name": "session-context",
+  "displayName": "Session Context",
+  "description": "Cross-conversation context lookup and digest MCP server: list, full-text search, and read distilled summaries or specific steps from past conversations without flooding the context window.",
+  "version": "1.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "List recent conversations in this workspace",
+    "Search past conversations for keywords and summarize the findings",
+    "Read the digest of the previous conversation in this repository"
+  ]
+}
