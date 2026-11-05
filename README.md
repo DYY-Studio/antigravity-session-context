@@ -11,8 +11,18 @@ A lightweight **Antigravity Plugin** that exposes a zero-dependency Python Stdio
 
 ## Installation
 
-1. Clone or copy this folder into `~/.gemini/config/plugins/session-context`:
+Requires Antigravity and Python 3 on your `PATH` (`python3`, `python`, or `py`).
+
+1. Clone or copy this folder into your Antigravity plugins directory:
+
    ```bash
+   # macOS / Linux
    git clone https://github.com/DYY-Studio/antigravity-session-context.git ~/.gemini/config/plugins/session-context
    ```
+
+   ```powershell
+   # Windows (PowerShell)
+   git clone https://github.com/DYY-Studio/antigravity-session-context.git "$HOME\.gemini\config\plugins\session-context"
+   ```
+
 2. Restart Antigravity so the new plugin and its `session-context` MCP server are loaded.

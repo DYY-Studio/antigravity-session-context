@@ -1,10 +1,10 @@
 {
   "mcpServers": {
     "session-context": {
-      "command": "python3",
+      "command": "node",
       "args": [
-        "-c",
-        "import os, runpy; runpy.run_path(os.path.expanduser('~/.gemini/config/plugins/session-context/mcp_server.py'), run_name='__main__')"
+        "-e",
+        "const {execFileSync,spawn}=require('node:child_process'),{existsSync}=require('node:fs'),{homedir}=require('node:os'),{join,resolve}=require('node:path');const g=process.env.ANTIGRAVITY_GEMINI_DIR||join(homedir(),'.gemini'),s=existsSync('mcp_server.py')?resolve('mcp_server.py'):join(g,'config','plugins','session-context','mcp_server.py'),c=process.platform==='win32'?[['python',[]],['py',['-3']],['python3',[]]]:[['python3',[]],['python',[]],['/opt/homebrew/bin/python3',[]],['/usr/local/bin/python3',[]]];let py=null;for(const[cmd,pre]of c){try{execFileSync(cmd,[...pre,'-c','import sys;raise SystemExit(0 if sys.version_info[0]>=3 else 1)'],{stdio:'ignore',timeout:5000,windowsHide:true});py=[cmd,pre];break;}catch{}}if(!py){process.stderr.write('Python 3 not found on PATH.\\n');process.exit(1);}const p=spawn(py[0],[...py[1],s],{stdio:'inherit',windowsHide:true,env:{...process.env,PYTHONIOENCODING:'utf-8',PYTHONUTF8:'1'}});p.on('exit',(code)=>process.exit(code??0));"
       ]
     }
   }

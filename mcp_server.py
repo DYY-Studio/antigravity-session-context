@@ -8,6 +8,7 @@ import re
 import sqlite3
 import sys
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
@@ -27,7 +28,8 @@ def open_summaries_db() -> sqlite3.Connection:
     db_path = app_data_dir() / "conversation_summaries.db"
     if not db_path.is_file():
         raise FileNotFoundError(f"Conversation summaries database not found: {db_path}")
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -39,16 +41,29 @@ def validate_conversation_id(cid: str) -> str:
     return cid.lower()
 
 
+def uri_to_path(uri: str) -> str:
+    s = str(uri or "").strip()
+    if s.startswith("file:"):
+        parsed = urlparse(s)
+        p = unquote(parsed.path)
+        if len(p) > 2 and p[0] == "/" and p[2] == ":":
+            p = p[1:]
+        if parsed.netloc and parsed.netloc != "localhost":
+            p = f"//{parsed.netloc}{p}"
+        return p
+    return s
+
+
 def parse_workspaces(raw_uris: str) -> list[str]:
     if not raw_uris:
         return []
     try:
         items = json.loads(raw_uris)
         if isinstance(items, list):
-            return [str(x).removeprefix("file://") for x in items]
+            return [uri_to_path(str(x)) for x in items]
     except json.JSONDecodeError:
         pass
-    return [raw_uris]
+    return [uri_to_path(raw_uris)]
 
 
 def extract_user_text(raw: str) -> str:
@@ -118,7 +133,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
 
         if workspace:
             clauses.append("workspace_uris LIKE ?")
-            params.append(f"%{workspace}%")
+            params.append(f"%{workspace.replace(chr(92), '/')}%")
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = (
@@ -168,7 +183,7 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         params: list[Any] = [fts_query]
         if workspace:
             clauses.append("s.workspace_uris LIKE ?")
-            params.append(f"%{workspace}%")
+            params.append(f"%{workspace.replace(chr(92), '/')}%")
 
         sql = (
             "SELECT f.conversation_id, s.title, s.step_count, s.last_modified_time, "
@@ -587,6 +602,10 @@ def handle_request(msg: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> None:
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
