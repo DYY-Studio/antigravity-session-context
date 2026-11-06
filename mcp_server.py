@@ -34,6 +34,13 @@ def open_summaries_db() -> sqlite3.Connection:
     return conn
 
 
+def get_arg(args: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for k in keys:
+        if k in args and args[k] is not None:
+            return args[k]
+    return default
+
+
 def validate_conversation_id(cid: str) -> str:
     cid = (cid or "").strip()
     if not UUID_RE.match(cid):
@@ -110,10 +117,10 @@ def list_artifacts(brain_dir: Path) -> list[str]:
 
 
 def tool_list_conversations(args: dict[str, Any]) -> str:
-    workspace = (args.get("workspace") or "").strip()
-    limit = max(1, min(int(args.get("limit", 15)), 100))
-    include_subagents = bool(args.get("include_subagents", False))
-    parent_id = (args.get("parent_conversation_id") or "").strip()
+    workspace = str(get_arg(args, "workspace", default="") or "").strip()
+    limit = max(1, min(int(get_arg(args, "limit", default=15)), 100))
+    include_subagents = bool(get_arg(args, "include_subagents", "includeSubagents", default=False))
+    parent_id = str(get_arg(args, "parent_conversation_id", "parentConversationId", default="") or "").strip()
 
     with open_summaries_db() as conn:
         sub_counts = dict(
@@ -172,10 +179,48 @@ def build_fts_query(raw_query: str) -> str:
     return " ".join(escaped)
 
 
+def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
+    tokens = [t.lower() for t in re.split(r"\s+", raw_query.strip()) if t]
+    if not tokens:
+        return ""
+    transcript_path = app_data_dir() / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+    if not transcript_path.is_file():
+        return ""
+    all_matches: list[int] = []
+    any_matches: list[int] = []
+    try:
+        with transcript_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                stype = obj.get("type")
+                if stype not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
+                    continue
+                idx = obj.get("step_index")
+                if idx is None:
+                    continue
+                hay = ((obj.get("content") or "") + " " + json.dumps(obj.get("tool_calls") or [], ensure_ascii=False)).lower()
+                if all(t in hay for t in tokens):
+                    all_matches.append(idx)
+                elif any(t in hay for t in tokens):
+                    any_matches.append(idx)
+    except Exception:
+        return ""
+    chosen = all_matches if all_matches else any_matches
+    if not chosen:
+        return ""
+    shown = ", ".join(str(i) for i in chosen[:max_shown])
+    if len(chosen) > max_shown:
+        return f"[{shown}, ... ({len(chosen)} steps)]"
+    return f"[{shown}]"
+
+
 def tool_search_conversations(args: dict[str, Any]) -> str:
-    raw_query = (args.get("query") or "").strip()
-    workspace = (args.get("workspace") or "").strip()
-    limit = max(1, min(int(args.get("limit", 10)), 50))
+    raw_query = str(get_arg(args, "query", default="") or "").strip()
+    workspace = str(get_arg(args, "workspace", default="") or "").strip()
+    limit = max(1, min(int(get_arg(args, "limit", default=10)), 50))
     fts_query = build_fts_query(raw_query)
 
     with open_summaries_db() as conn:
@@ -224,10 +269,12 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         title = r["title"] or "(untitled)"
         ws = ", ".join(parse_workspaces(r["workspace_uris"] or "")) or "-"
         parent_tag = f" | parent={r['parent_conversation_id']}" if r["parent_conversation_id"] else ""
+        step_hits = find_matching_steps(cid, raw_query)
+        step_hits_line = f"\n  matched_steps: {step_hits}" if step_hits else ""
         lines.append(
             f"- {cid} | {r['last_modified_time']} | steps={r['step_count']}{parent_tag}\n"
             f"  title: {title}\n"
-            f"  workspace: {ws}"
+            f"  workspace: {ws}{step_hits_line}"
         )
         for s in info["snippets"]:
             lines.append(f"  match: {s}")
@@ -253,12 +300,16 @@ def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[s
 
 
 def tool_get_conversation_digest(args: dict[str, Any]) -> str:
-    cid = validate_conversation_id(args.get("conversation_id", ""))
-    include_tools = bool(args.get("include_tools", True))
-    include_thinking = bool(args.get("include_thinking", False))
-    include_system = bool(args.get("include_system_messages", True))
-    start_step = int(args["start_step"]) if args.get("start_step") is not None else 0
-    end_step = int(args["end_step"]) if args.get("end_step") is not None else None
+    cid = validate_conversation_id(str(get_arg(args, "conversation_id", "conversationId", default="")))
+    include_tools = bool(get_arg(args, "include_tools", "includeTools", default=True))
+    include_thinking = bool(get_arg(args, "include_thinking", "includeThinking", default=False))
+    include_system = bool(get_arg(args, "include_system_messages", "includeSystemMessages", default=True))
+    raw_start = get_arg(args, "start_step", "startStep")
+    raw_end = get_arg(args, "end_step", "endStep")
+    has_explicit_start = raw_start is not None
+    start_step = int(raw_start) if raw_start is not None else 0
+    end_step = int(raw_end) if raw_end is not None else None
+    max_chars = max(2000, min(int(get_arg(args, "max_chars", "maxChars", default=24000)), 100000))
 
     brain_dir = app_data_dir() / "brain" / cid
     logs_dir = brain_dir / ".system_generated" / "logs"
@@ -268,7 +319,47 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     if not transcript_path.is_file():
         raise FileNotFoundError(f"Transcript not found for conversation {cid}: {transcript_path}")
 
-    meta_line = f"Conversation: {cid}"
+    steps: list[dict[str, Any]] = []
+    need_full: set[int] = set()
+    planner_result_steps: dict[int, list[int]] = {}
+    last_planner_idx: int | None = None
+    min_file_idx: int | None = None
+    max_file_idx: int | None = None
+    total_file_steps = 0
+
+    with transcript_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            idx = obj.get("step_index", 0)
+            t = obj.get("type")
+            total_file_steps += 1
+            if min_file_idx is None or idx < min_file_idx:
+                min_file_idx = idx
+            if max_file_idx is None or idx > max_file_idx:
+                max_file_idx = idx
+
+            if t == "PLANNER_RESPONSE":
+                last_planner_idx = idx
+                planner_result_steps[idx] = []
+            elif t == "GENERIC" and last_planner_idx is not None:
+                planner_result_steps[last_planner_idx].append(idx)
+            else:
+                last_planner_idx = None
+
+            if idx < start_step:
+                continue
+            if end_step is not None and idx > end_step:
+                continue
+            steps.append(obj)
+            trunc = obj.get("truncated_fields") or []
+            if t in ("USER_INPUT", "PLANNER_RESPONSE") and "content" in trunc:
+                need_full.add(idx)
+
+    step_range_str = f"{min_file_idx or 0}..{max_file_idx or 0} ({total_file_steps} steps)"
+    meta_line = f"Conversation: {cid}\nStep range: {step_range_str}"
     subagents: list[str] = []
     try:
         with open_summaries_db() as conn:
@@ -283,7 +374,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 meta_line = (
                     f"Conversation: {cid}\n"
                     f"Title: {row['title'] or '(untitled)'}\n"
-                    f"Updated: {row['last_modified_time']} | Total steps: {row['step_count']}{parent_info}\n"
+                    f"Updated: {row['last_modified_time']} | Step range: {step_range_str}{parent_info}\n"
                     f"Workspace: {ws}"
                 )
             sub_rows = conn.execute(
@@ -295,38 +386,21 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     except FileNotFoundError:
         pass
 
-    steps: list[dict[str, Any]] = []
-    need_full: set[int] = set()
-    with transcript_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            obj = json.loads(line)
-            idx = obj.get("step_index", 0)
-            if idx < start_step:
-                continue
-            if end_step is not None and idx > end_step:
-                continue
-            steps.append(obj)
-            t = obj.get("type")
-            trunc = obj.get("truncated_fields") or []
-            if t in ("USER_INPUT", "PLANNER_RESPONSE") and "content" in trunc:
-                need_full.add(idx)
-
     full_map = load_full_steps(full_path, need_full)
 
-    out = [meta_line]
+    header_parts = [meta_line]
     artifacts = list_artifacts(brain_dir)
     if artifacts:
-        out.append("Artifacts:\n" + "\n".join(f"  - {a}" for a in artifacts))
+        header_parts.append("Artifacts:\n" + "\n".join(f"  - {a}" for a in artifacts))
     if subagents:
-        out.append("Subagents:\n" + "\n".join(f"  - {s}" for s in subagents))
-    out.append("--- Digest ---")
+        header_parts.append("Subagents:\n" + "\n".join(f"  - {s}" for s in subagents))
+    header_parts.append("--- Digest ---")
+    header_text = "\n".join(header_parts)
 
+    rendered_steps: list[tuple[int, str]] = []
     ask_question_pending = False
     for obj in steps:
-        idx = obj.get("step_index")
+        idx = obj.get("step_index", 0)
         stype = obj.get("type")
         created = obj.get("created_at", "")
         full_note = ""
@@ -337,7 +411,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         if stype == "USER_INPUT":
             ask_question_pending = False
             text = extract_user_text(obj.get("content", ""))
-            out.append(f"\n[Step {idx} | USER | {created}]{full_note}\n{text}")
+            rendered_steps.append((idx, f"\n[Step {idx} | USER | {created}]{full_note}\n{text}"))
 
         elif stype == "PLANNER_RESPONSE":
             ask_question_pending = False
@@ -346,7 +420,14 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 parts.append(f"<thinking>\n{obj['thinking'].strip()}\n</thinking>")
             tcalls = obj.get("tool_calls") or []
             if include_tools and tcalls:
-                summaries = [summarize_tool_call(tc) for tc in tcalls]
+                res_indices = planner_result_steps.get(idx, [])
+                summaries = []
+                for j, tc in enumerate(tcalls):
+                    sc = summarize_tool_call(tc)
+                    if j < len(res_indices):
+                        summaries.append(f"[Step {res_indices[j]}] {sc}")
+                    else:
+                        summaries.append(sc)
                 parts.append("Tools: " + "; ".join(summaries))
             for tc in tcalls:
                 if tc.get("name") == "ask_question":
@@ -355,30 +436,67 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if content:
                 parts.append(content)
             if parts:
-                out.append(f"\n[Step {idx} | AGENT | {created}]{full_note}\n" + "\n".join(parts))
+                rendered_steps.append((idx, f"\n[Step {idx} | AGENT | {created}]{full_note}\n" + "\n".join(parts)))
 
         elif stype == "GENERIC" and ask_question_pending:
             ask_question_pending = False
             ans = (obj.get("content") or "").strip()
             if ans:
-                out.append(f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}")
+                rendered_steps.append((idx, f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}"))
 
         elif stype in ("SYSTEM_MESSAGE", "CHECKPOINT") and include_system:
             raw = (obj.get("content") or "").strip()
             preview = raw[:400] + ("..." if len(raw) > 400 else "")
-            out.append(f"\n[Step {idx} | {stype} | {created}]\n{preview}")
+            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]\n{preview}"))
 
-    return "\n".join(out)
+    body_text = "\n".join(block for _, block in rendered_steps)
+    if len(header_text) + 1 + len(body_text) <= max_chars or not rendered_steps:
+        return f"{header_text}\n{body_text}" if body_text else header_text
+
+    budget = max(1000, max_chars - len(header_text) - 220)
+    if has_explicit_start:
+        kept: list[tuple[int, str]] = []
+        used = 0
+        for item in rendered_steps:
+            if kept and used + len(item[1]) + 1 > budget:
+                break
+            kept.append(item)
+            used += len(item[1]) + 1
+        last_kept = kept[-1][0]
+        kept_body = "\n".join(block for _, block in kept)
+        return (
+            f"{header_text}\n{kept_body}\n\n"
+            f"... [Digest capped at {max_chars} chars (showing steps {kept[0][0]}..{last_kept}); "
+            f"pass start_step={last_kept + 1} to continue]"
+        )
+    else:
+        kept_rev: list[tuple[int, str]] = []
+        used = 0
+        for item in reversed(rendered_steps):
+            if kept_rev and used + len(item[1]) + 1 > budget:
+                break
+            kept_rev.append(item)
+            used += len(item[1]) + 1
+        kept = list(reversed(kept_rev))
+        first_kept = kept[0][0]
+        last_kept = kept[-1][0]
+        kept_body = "\n".join(block for _, block in kept)
+        banner = (
+            f"\n[Showing most recent steps {first_kept}..{last_kept} of {min_file_idx or 0}..{max_file_idx or 0} "
+            f"(digest capped at {max_chars} chars); pass start_step=0, end_step={max(0, first_kept - 1)} to inspect earlier steps]"
+        )
+        return f"{header_text}{banner}\n{kept_body}"
 
 
 def tool_get_conversation_step(args: dict[str, Any]) -> str:
-    cid = validate_conversation_id(args.get("conversation_id", ""))
-    if "step_index" not in args or args["step_index"] is None:
+    cid = validate_conversation_id(str(get_arg(args, "conversation_id", "conversationId", default="")))
+    raw_step = get_arg(args, "step_index", "stepIndex")
+    if raw_step is None:
         raise ValueError("step_index is required.")
-    target_idx = int(args["step_index"])
-    use_full = bool(args.get("full", False))
-    offset = max(0, int(args.get("offset", 0)))
-    max_chars = max(500, min(int(args.get("max_chars", 16000)), 100000))
+    target_idx = int(raw_step)
+    use_full = bool(get_arg(args, "full", default=False))
+    offset = max(0, int(get_arg(args, "offset", default=0)))
+    max_chars = max(500, min(int(get_arg(args, "max_chars", "maxChars", default=16000)), 100000))
 
     logs_dir = app_data_dir() / "brain" / cid / ".system_generated" / "logs"
     transcript_path = logs_dir / "transcript.jsonl"
@@ -469,7 +587,7 @@ TOOLS = [
     },
     {
         "name": "get_conversation_digest",
-        "description": "Get a clean, low-token digest of a conversation (metadata, artifacts, subagents, user requests, tool call summaries, and agent replies), skipping noisy raw tool outputs.",
+        "description": "Get a clean, low-token digest of a conversation (metadata, artifacts, subagents, user requests, tool call summaries with result step indices, and agent replies), skipping noisy raw tool outputs.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -479,7 +597,7 @@ TOOLS = [
                 },
                 "include_tools": {
                     "type": "boolean",
-                    "description": "Include compact one-line summaries of tool calls (default true).",
+                    "description": "Include compact one-line summaries of tool calls with their result step_index (default true).",
                 },
                 "include_thinking": {
                     "type": "boolean",
@@ -496,6 +614,10 @@ TOOLS = [
                 "end_step": {
                     "type": "integer",
                     "description": "Optional ending step_index (inclusive).",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return (default 24000, max 100000). When start_step is omitted and the digest exceeds max_chars, the most recent steps within budget are returned.",
                 },
             },
             "required": ["conversation_id"],
