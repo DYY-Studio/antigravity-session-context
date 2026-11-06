@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "session-context": {
+    "mcp": {
       "command": "node",
       "args": [
         "-e",

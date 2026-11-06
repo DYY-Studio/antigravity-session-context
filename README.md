@@ -25,4 +25,4 @@ Requires Antigravity and Python 3 on your `PATH` (`python3`, `python`, or `py`).
    git clone https://github.com/DYY-Studio/antigravity-session-context.git "$HOME\.gemini\config\plugins\session-context"
    ```
 
-2. Restart Antigravity so the new plugin and its `session-context` MCP server are loaded.
+2. Restart Antigravity so the new plugin and its `session-context_mcp` MCP server are loaded.
