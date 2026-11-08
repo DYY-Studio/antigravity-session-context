@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlparse
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
+MSG_HEADER_RE = re.compile(r"^\[Message\]\s+timestamp=\S+\s+sender=(\S+)\s+priority=\S+\s+content=(.*)", re.DOTALL)
 SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-fA-F-]{36})"')
 
 
@@ -95,6 +96,14 @@ def format_duration(seconds: float | None) -> str:
     return f"{whole}s"
 
 
+def compact_ts(ts: str) -> str:
+    s = str(ts or "").strip()
+    dt = parse_iso_ts(s)
+    if dt is not None:
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return s
+
+
 def extract_user_text(raw: str) -> str:
     m = USER_REQ_RE.search(raw or "")
     if m:
@@ -102,6 +111,22 @@ def extract_user_text(raw: str) -> str:
     cleaned = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", raw or "", flags=re.DOTALL)
     cleaned = re.sub(r"<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>", "", cleaned, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def extract_system_message(raw: str) -> tuple[str, str]:
+    """Return (sender, cleaned_text) from a SYSTEM_MESSAGE payload."""
+    inner = (raw or "").strip()
+    if "<SYSTEM_MESSAGE>" in inner:
+        inner = inner.split("<SYSTEM_MESSAGE>")[-1]
+    if inner.endswith("</SYSTEM_MESSAGE>"):
+        inner = inner[: -len("</SYSTEM_MESSAGE>")]
+    inner = inner.strip()
+    mh = MSG_HEADER_RE.match(inner)
+    if mh:
+        sender = mh.group(1).strip()
+        body = mh.group(2).strip()
+        return sender, f"[from {sender}] {body}"
+    return "", inner
 
 
 def _unwrap_arg_value(val: Any) -> Any:
@@ -141,21 +166,17 @@ def summarize_tool_call(tc: dict[str, Any]) -> str:
     if name == "call_mcp_tool":
         srv = _clean_scalar(args.get("ServerName", ""), 40)
         tname = _clean_scalar(args.get("ToolName", ""), 40)
-        parts = []
-        if srv:
-            parts.append(f"ServerName={srv}")
-        if tname:
-            parts.append(f"ToolName={tname}")
+        call_name = f"{srv}.{tname}" if (srv and tname) else (tname or srv or name)
         raw_inner = _unwrap_arg_value(args.get("Arguments"))
         if isinstance(raw_inner, dict) and raw_inner:
             inner_items = [f"{k}={_clean_scalar(v, 48)}" for k, v in raw_inner.items() if v is not None]
             inner_str = ", ".join(inner_items)
             if len(inner_str) > 120:
                 inner_str = inner_str[:117] + "..."
-            parts.append(f"Arguments={{{inner_str}}}")
+            return f"{call_name}({inner_str})"
         elif raw_inner is not None and raw_inner != "":
-            parts.append(f"Arguments={_clean_scalar(raw_inner, 100)}")
-        return f"{name}({', '.join(parts)})"
+            return f"{call_name}({_clean_scalar(raw_inner, 100)})"
+        return f"{call_name}()"
 
     highlights = []
     priority_keys = (
@@ -365,14 +386,14 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
         parent_tag = f" | parent={parent_cid}" if parent_cid else ""
 
         metrics_tag = f"steps={r['step_count']}"
-        if parent_cid or r["step_count"] <= 500:
+        if parent_cid:
             m = compute_transcript_metrics(cid)
             if m:
                 dur_part = f" | duration={m['duration']}" if m.get("duration") else ""
                 metrics_tag = f"steps={m['steps']} | turns={m['turns']} | tools={m['tools']}{dur_part}"
 
         lines.append(
-            f"- {cid} | {r['last_modified_time']} | {metrics_tag}{sub_tag}{parent_tag}\n"
+            f"- {cid} | {compact_ts(r['last_modified_time'])} | {metrics_tag}{sub_tag}{parent_tag}\n"
             f"  title: {title}\n"
             f"  workspace: {ws}"
         )
@@ -552,7 +573,7 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         step_hits = info.get("precomputed_hits") or find_matching_steps(cid, raw_query)
         step_hits_line = f"\n  matched_steps: {step_hits}" if step_hits else ""
         lines.append(
-            f"- {cid} | {r['last_modified_time']} | steps={r['step_count']}{parent_tag}\n"
+            f"- {cid} | {compact_ts(r['last_modified_time'])} | steps={r['step_count']}{parent_tag}\n"
             f"  title: {title}\n"
             f"  workspace: {ws}{step_hits_line}"
         )
@@ -584,10 +605,13 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     include_tools = bool(get_arg(args, "include_tools", "includeTools", default=True))
     include_thinking = bool(get_arg(args, "include_thinking", "includeThinking", default=False))
     include_system = bool(get_arg(args, "include_system_messages", "includeSystemMessages", default=True))
+    raw_inc_subagents = get_arg(args, "include_subagents", "includeSubagents")
     raw_query = str(get_arg(args, "query", default="") or "").strip()
     has_query = bool(raw_query)
     raw_start = get_arg(args, "start_step", "startStep")
     raw_end = get_arg(args, "end_step", "endStep")
+    is_scoped = raw_start is not None or raw_end is not None or has_query
+    include_subagents = bool(raw_inc_subagents) if raw_inc_subagents is not None else (not is_scoped)
     has_explicit_start = raw_start is not None or has_query
     start_step = int(raw_start) if raw_start is not None else 0
     end_step = int(raw_end) if raw_end is not None else None
@@ -683,6 +707,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     )
     meta_line = f"Conversation: {cid}\nStep range: {step_range_str}"
     subagents: list[str] = []
+    subagent_total = 0
     try:
         with open_summaries_db() as conn:
             row = conn.execute(
@@ -704,7 +729,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 meta_line = (
                     f"Conversation: {cid}\n"
                     f"Title: {title_str}\n"
-                    f"Updated: {row['last_modified_time']} | Step range: {step_range_str}{parent_info}\n"
+                    f"Updated: {compact_ts(row['last_modified_time'])} | Step range: {step_range_str}{parent_info}\n"
                     f"Workspace: {ws}"
                 )
             sub_rows = conn.execute(
@@ -712,29 +737,34 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 "WHERE parent_conversation_id = ? ORDER BY last_modified_time ASC",
                 (cid,),
             ).fetchall()
-            for sr in sub_rows:
-                scid = sr["conversation_id"]
-                s_metrics = compute_transcript_metrics(scid)
-                rtag = format_subagent_role_tag(subagent_role_map.get(scid.lower()))
-                role_part = f" | role={rtag}" if rtag else ""
-                if s_metrics:
-                    sdur = f", duration={s_metrics['duration']}" if s_metrics.get("duration") else ""
-                    subagents.append(
-                        f"{scid}{role_part} (steps={s_metrics['steps']}, turns={s_metrics['turns']}, tools={s_metrics['tools']}{sdur})"
-                    )
-                else:
-                    subagents.append(f"{scid}{role_part} (steps={sr['step_count']})")
+            subagent_total = len(sub_rows)
+            if include_subagents:
+                for sr in sub_rows:
+                    scid = sr["conversation_id"]
+                    s_metrics = compute_transcript_metrics(scid)
+                    rtag = format_subagent_role_tag(subagent_role_map.get(scid.lower()))
+                    role_part = f" | role={rtag}" if rtag else ""
+                    if s_metrics:
+                        sdur = f", duration={s_metrics['duration']}" if s_metrics.get("duration") else ""
+                        subagents.append(
+                            f"{scid}{role_part} (steps={s_metrics['steps']}, turns={s_metrics['turns']}, tools={s_metrics['tools']}{sdur})"
+                        )
+                    else:
+                        subagents.append(f"{scid}{role_part} (steps={sr['step_count']})")
     except FileNotFoundError:
         pass
 
     full_map = load_full_steps(full_path, need_full)
 
     header_parts = [meta_line]
-    artifacts = list_artifacts(brain_dir)
-    if artifacts:
-        header_parts.append("Artifacts:\n" + "\n".join(f"  - {a}" for a in artifacts))
+    if not is_scoped:
+        artifacts = list_artifacts(brain_dir)
+        if artifacts:
+            header_parts.append("Artifacts:\n" + "\n".join(f"  - {a}" for a in artifacts))
     if subagents:
         header_parts.append("Subagents:\n" + "\n".join(f"  - {s}" for s in subagents))
+    elif subagent_total > 0:
+        header_parts.append(f"Subagents: {subagent_total} (pass include_subagents=true or use list_conversations to expand)")
     if has_query:
         header_parts.append(f"--- Digest (filtered by query={raw_query!r}) ---")
     else:
@@ -747,10 +777,8 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         idx = obj.get("step_index", 0)
         stype = obj.get("type")
         created = obj.get("created_at", "")
-        full_note = ""
         if idx in full_map:
             obj = full_map[idx]
-            full_note = " [restored from transcript_full.jsonl]"
 
         matched_query, matched_in_thinking = match_query_in_step(obj, raw_query) if has_query else (True, False)
 
@@ -759,7 +787,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if not matched_query:
                 continue
             text = extract_user_text(obj.get("content", ""))
-            rendered_steps.append((idx, f"\n[Step {idx} | USER | {created}]{full_note}\n{text}"))
+            rendered_steps.append((idx, f"\n[Step {idx} | USER | {created}]\n{text}"))
 
         elif stype == "PLANNER_RESPONSE":
             tcalls = obj.get("tool_calls") or []
@@ -789,7 +817,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if content:
                 parts.append(content)
             if parts:
-                rendered_steps.append((idx, f"\n[Step {idx} | AGENT | {created}]{full_note}\n" + "\n".join(parts)))
+                rendered_steps.append((idx, f"\n[Step {idx} | AGENT | {created}]\n" + "\n".join(parts)))
 
         elif stype == "GENERIC" and ask_question_pending:
             ask_question_pending = False
@@ -799,13 +827,23 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if ans:
                 rendered_steps.append((idx, f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}"))
 
-        elif stype in ("SYSTEM_MESSAGE", "CHECKPOINT") and include_system:
+        elif stype == "SYSTEM_MESSAGE" and include_system:
+            if not matched_query:
+                continue
+            sender, clean_sys = extract_system_message(obj.get("content") or "")
+            if not has_query and ("/task-" in sender or clean_sys.startswith("Task id ")):
+                continue
+            cap = 1200 if has_query else 400
+            preview = clean_sys[:cap] + ("..." if len(clean_sys) > cap else "")
+            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]\n{preview}"))
+
+        elif stype == "CHECKPOINT" and include_system:
             if not matched_query:
                 continue
             raw = (obj.get("content") or "").strip()
             cap = 1200 if has_query else 400
             preview = raw[:cap] + ("..." if len(raw) > cap else "")
-            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]{full_note}\n{preview}"))
+            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]\n{preview}"))
 
     if has_query and not rendered_steps:
         return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_step or (max_file_idx or 0)}."
@@ -909,7 +947,7 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
             continue
         if idx in upgraded_map:
             obj = upgraded_map[idx]
-            src_note = "transcript_full.jsonl (auto-upgraded due to truncated_fields)"
+            src_note = "transcript_full.jsonl"
         else:
             obj = found_map[idx]
             src_note = chosen_path.name
@@ -1001,7 +1039,11 @@ TOOLS = [
                 },
                 "include_system_messages": {
                     "type": "boolean",
-                    "description": "Include system/subagent notifications and compaction checkpoints (default true).",
+                    "description": "Include subagent notifications and compaction checkpoints, excluding noisy timer/task wakeups (default true).",
+                },
+                "include_subagents": {
+                    "type": "boolean",
+                    "description": "Whether to expand the full subagent list and metrics in the header (defaults to true for full overview, false when start_step/end_step/query is set).",
                 },
                 "start_step": {
                     "type": "integer",
