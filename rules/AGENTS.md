@@ -1,10 +1,10 @@
-# Cross-Conversation Context Lookup (`session-context`)
+# Cross-Conversation & Subagent Context Lookup (`session-context`)
 
-When the user asks to reference, search, or inspect another conversation (by `conversation-id`, topic/keyword, or workspace/recent history):
+When the user asks to reference, search, or inspect another conversation, **or when you need to audit, debug, or collect metrics on subagents** (including subagents spawned in the current conversation whose `invoke_subagent` output includes `logAbsoluteUri`):
 
-1. **Prefer `session-context_mcp` MCP tools over raw file reads**:
-   - `list_conversations({ workspace?, limit?, include_subagents?, parent_conversation_id? })`: List recent conversations.
-   - `search_conversations({ query, workspace?, limit? })`: Run full-text FTS5 searches across titles, user requests, and agent responses (returns matching `conversation_id`, snippets, and `matched_steps`).
-   - `get_conversation_digest({ conversation_id, start_step?, end_step?, max_chars?, include_tools?, include_thinking?, include_system_messages? })`: Retrieve a distilled, low-token summary of turns, tool calls (annotated with their `[Step N]` result index), artifacts, and subagents.
-   - `get_conversation_step({ conversation_id, step_index, full?, offset?, max_chars? })`: Inspect the raw tool output or full untruncated payload of a specific `step_index`.
-2. **Avoid reading raw `transcript.jsonl` or `transcript_full.jsonl` directly with `read_file`** unless the `session-context` MCP tools are unavailable, as raw transcripts include large `GENERIC` tool outputs that rapidly exhaust the context window.
+1. **Always use `session-context_mcp` MCP tools instead of writing Python/shell scripts or calling `read_file` on transcripts**:
+   - `list_conversations({ workspace?, limit?, include_subagents?, parent_conversation_id? })`: List recent conversations, or pass `parent_conversation_id` to get all subagents of a conversation with their extracted `Role`, `steps`, `turns`, `tools`, and wall-clock `duration`.
+   - `search_conversations({ query, workspace?, parent_conversation_id?, limit? })`: Search across titles, user requests, agent responses, and subagent transcripts (supports `|` for OR alternatives; returns matching `conversation_id`, snippets, and `matched_steps`).
+   - `get_conversation_digest({ conversation_id, query?, start_step?, end_step?, max_chars?, include_tools?, include_thinking?, include_system_messages? })`: Retrieve a low-token digest with execution metrics (`steps`, `turns`, `tools`, `duration`), artifacts, subagent role/metric summaries, and tool calls annotated with `[Step N]` result indices and inner MCP `Arguments` (automatically restoring truncated `content`, `thinking`, and `tool_calls` from `transcript_full.jsonl`). Pass `query` (e.g. `"region_id|keyword"`) to filter only matching steps across `content`, `thinking`, and `tool_calls`.
+   - `get_conversation_step({ conversation_id, step_index?, step_indices?, full?, offset?, max_chars? })`: Inspect the raw tool output or full untruncated JSON of a single `step_index` or a batch of `step_indices` (e.g. `[14, 16, 31]`) in one call.
+2. **Never read or parse raw `transcript.jsonl` or `transcript_full.jsonl` with `read_file` or custom `python -c` scripts** unless the `session-context_mcp` tools are unavailable. Raw transcripts contain large `GENERIC` tool outputs and truncated fields in `transcript.jsonl` that `session-context_mcp` automatically handles and upgrades from `transcript_full.jsonl`.
