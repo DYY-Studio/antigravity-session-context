@@ -11,6 +11,17 @@ import sys
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+from context_stats import (
+    format_compact_context_tag,
+    inspect_conversation_db,
+    load_model_catalog,
+    render_context_report,
+)
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 MSG_HEADER_RE = re.compile(r"^\[Message\]\s+timestamp=\S+\s+sender=(\S+)\s+priority=\S+\s+content=(.*)", re.DOTALL)
@@ -301,11 +312,20 @@ def compute_transcript_metrics(cid: str) -> dict[str, Any]:
     }
 
 
-def format_subagent_role_tag(role_info: dict[str, Any] | None) -> str:
-    if not role_info:
-        return ""
-    role = role_info.get("role") or ""
-    meta = [x for x in (role_info.get("type"), role_info.get("model")) if x]
+def format_subagent_role_tag(role_info: dict[str, Any] | None, ctx: dict[str, Any] | None = None) -> str:
+    rinfo = role_info or {}
+    role = rinfo.get("role") or (ctx.get("role") if ctx else "") or ""
+    tname = rinfo.get("type") or (ctx.get("type_name") if ctx else "") or ""
+    model = rinfo.get("model") or ""
+    if ctx and ctx.get("model") and ctx["model"] != "Unknown Model" and model.lower() in (
+        "",
+        "inherit",
+        "flash",
+        "flash_lite",
+        "pro",
+    ):
+        model = ctx["model"]
+    meta = [x for x in (tname, model) if x]
     meta_str = f" ({', '.join(meta)})" if meta else ""
     if role:
         return f"{role}{meta_str}"
@@ -355,7 +375,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = (
             "SELECT conversation_id, title, step_count, last_modified_time, "
-            "workspace_uris, parent_conversation_id, status "
+            "workspace_uris, parent_conversation_id, status, killed, agent_name, nesting_depth "
             f"FROM conversation_summaries {where_sql} "
             "ORDER BY last_modified_time DESC LIMIT ?"
         )
@@ -365,18 +385,40 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
     if not rows:
         return "No matching conversations found."
 
+    app_dir = app_data_dir()
+    catalog: dict[str, Any] | None = None
     parent_role_cache: dict[str, dict[str, dict[str, Any]]] = {}
     lines = [f"Found {len(rows)} conversation(s):"]
     for r in rows:
         cid = r["conversation_id"]
         parent_cid = r["parent_conversation_id"] or ""
         title = r["title"] or ""
-        if not title and parent_cid:
-            if parent_cid not in parent_role_cache:
-                parent_role_cache[parent_cid] = extract_parent_subagent_map(parent_cid)
-            rinfo = parent_role_cache[parent_cid].get(cid.lower())
-            role_label = format_subagent_role_tag(rinfo)
-            title = f"[Subagent] {role_label}" if role_label else "(untitled subagent)"
+        rinfo: dict[str, Any] | None = None
+        sub_ctx: dict[str, Any] | None = None
+        if parent_cid:
+            if catalog is None:
+                catalog = load_model_catalog(app_dir)
+            if not title:
+                if parent_cid not in parent_role_cache:
+                    parent_role_cache[parent_cid] = extract_parent_subagent_map(parent_cid)
+                rinfo = parent_role_cache[parent_cid].get(cid.lower())
+            sub_ctx = inspect_conversation_db(
+                cid,
+                app_dir,
+                catalog=catalog,
+                summary_meta={
+                    "status": r["status"],
+                    "killed": r["killed"],
+                    "agent_name": r["agent_name"],
+                    "nesting_depth": r["nesting_depth"],
+                    "parent_conversation_id": parent_cid,
+                    "role": (rinfo or {}).get("role", ""),
+                    "type_name": (rinfo or {}).get("type", ""),
+                },
+            )
+            if not title:
+                role_label = format_subagent_role_tag(rinfo, sub_ctx)
+                title = f"[Subagent] {role_label}" if role_label else "(untitled subagent)"
         elif not title:
             title = "(untitled)"
 
@@ -391,6 +433,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
             if m:
                 dur_part = f" | duration={m['duration']}" if m.get("duration") else ""
                 metrics_tag = f"steps={m['steps']} | turns={m['turns']} | tools={m['tools']}{dur_part}"
+            metrics_tag = f"{metrics_tag} | {format_compact_context_tag(sub_ctx)}"
 
         lines.append(
             f"- {cid} | {compact_ts(r['last_modified_time'])} | {metrics_tag}{sub_tag}{parent_tag}\n"
@@ -705,13 +748,16 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         f"{min_file_idx or 0}..{max_file_idx or 0} "
         f"({total_file_steps} steps, turns={total_turns}, tools={total_tools}{dur_part})"
     )
+    app_dir = app_data_dir()
+    catalog = load_model_catalog(app_dir) if (not is_scoped or include_subagents) else None
     meta_line = f"Conversation: {cid}\nStep range: {step_range_str}"
     subagents: list[str] = []
     subagent_total = 0
     try:
         with open_summaries_db() as conn:
             row = conn.execute(
-                "SELECT title, step_count, last_modified_time, workspace_uris, parent_conversation_id "
+                "SELECT title, step_count, last_modified_time, workspace_uris, "
+                "parent_conversation_id, status, killed, agent_name, nesting_depth "
                 "FROM conversation_summaries WHERE conversation_id = ?",
                 (cid,),
             ).fetchone()
@@ -719,21 +765,56 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 ws = ", ".join(parse_workspaces(row["workspace_uris"])) or "-"
                 parent_cid = row["parent_conversation_id"] or ""
                 parent_info = f" | parent={parent_cid}" if parent_cid else ""
+                self_ctx = (
+                    inspect_conversation_db(
+                        cid,
+                        app_dir,
+                        catalog=catalog,
+                        summary_meta={
+                            "status": row["status"],
+                            "killed": row["killed"],
+                            "agent_name": row["agent_name"],
+                            "nesting_depth": row["nesting_depth"],
+                            "parent_conversation_id": parent_cid,
+                        },
+                    )
+                    if not is_scoped
+                    else None
+                )
                 title_str = row["title"] or ""
                 if not title_str and parent_cid:
                     parent_map = extract_parent_subagent_map(parent_cid)
-                    role_label = format_subagent_role_tag(parent_map.get(cid))
+                    role_label = format_subagent_role_tag(parent_map.get(cid), self_ctx)
                     title_str = f"[Subagent] {role_label}" if role_label else "(untitled subagent)"
                 elif not title_str:
                     title_str = "(untitled)"
+                ctx_part = ""
+                if not is_scoped:
+                    ctx_line = (
+                        f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
+                        if self_ctx is not None
+                        else format_compact_context_tag(None)
+                    )
+                    ctx_part = f"Context: {ctx_line}\n"
                 meta_line = (
                     f"Conversation: {cid}\n"
                     f"Title: {title_str}\n"
                     f"Updated: {compact_ts(row['last_modified_time'])} | Step range: {step_range_str}{parent_info}\n"
+                    f"{ctx_part}"
                     f"Workspace: {ws}"
                 )
+            elif not is_scoped:
+                self_ctx = inspect_conversation_db(cid, app_dir, catalog=catalog)
+                ctx_line = (
+                    f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
+                    if self_ctx is not None
+                    else format_compact_context_tag(None)
+                )
+                meta_line = f"Conversation: {cid}\nStep range: {step_range_str}\nContext: {ctx_line}"
+
             sub_rows = conn.execute(
-                "SELECT conversation_id, step_count, last_modified_time FROM conversation_summaries "
+                "SELECT conversation_id, step_count, last_modified_time, status, killed, agent_name, nesting_depth "
+                "FROM conversation_summaries "
                 "WHERE parent_conversation_id = ? ORDER BY last_modified_time ASC",
                 (cid,),
             ).fetchall()
@@ -741,18 +822,42 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if include_subagents:
                 for sr in sub_rows:
                     scid = sr["conversation_id"]
+                    s_rinfo = subagent_role_map.get(scid.lower())
+                    s_ctx = inspect_conversation_db(
+                        scid,
+                        app_dir,
+                        catalog=catalog,
+                        summary_meta={
+                            "status": sr["status"],
+                            "killed": sr["killed"],
+                            "agent_name": sr["agent_name"],
+                            "nesting_depth": sr["nesting_depth"],
+                            "parent_conversation_id": cid,
+                            "role": (s_rinfo or {}).get("role", ""),
+                            "type_name": (s_rinfo or {}).get("type", ""),
+                        },
+                    )
                     s_metrics = compute_transcript_metrics(scid)
-                    rtag = format_subagent_role_tag(subagent_role_map.get(scid.lower()))
+                    rtag = format_subagent_role_tag(s_rinfo, s_ctx)
                     role_part = f" | role={rtag}" if rtag else ""
+                    ctx_tag = format_compact_context_tag(s_ctx)
                     if s_metrics:
                         sdur = f", duration={s_metrics['duration']}" if s_metrics.get("duration") else ""
                         subagents.append(
-                            f"{scid}{role_part} (steps={s_metrics['steps']}, turns={s_metrics['turns']}, tools={s_metrics['tools']}{sdur})"
+                            f"{scid}{role_part} (steps={s_metrics['steps']}, turns={s_metrics['turns']}, "
+                            f"tools={s_metrics['tools']}{sdur} | {ctx_tag})"
                         )
                     else:
-                        subagents.append(f"{scid}{role_part} (steps={sr['step_count']})")
+                        subagents.append(f"{scid}{role_part} (steps={sr['step_count']} | {ctx_tag})")
     except FileNotFoundError:
-        pass
+        if not is_scoped:
+            self_ctx = inspect_conversation_db(cid, app_dir, catalog=catalog)
+            ctx_line = (
+                f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
+                if self_ctx is not None
+                else format_compact_context_tag(None)
+            )
+            meta_line = f"{meta_line}\nContext: {ctx_line}"
 
     full_map = load_full_steps(full_path, need_full)
 
@@ -963,10 +1068,139 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
     return f"{sliced}{more_note}"
 
 
+def tool_get_conversation_context(args: dict[str, Any]) -> str:
+    raw_cid = get_arg(args, "conversation_id", "conversationId")
+    raw_cids = get_arg(args, "conversation_ids", "conversationIds")
+
+    target_ids: list[str] = []
+    if raw_cid is not None and str(raw_cid).strip():
+        target_ids.append(validate_conversation_id(str(raw_cid)))
+    if isinstance(raw_cids, list):
+        for item in raw_cids:
+            if item is None or not str(item).strip():
+                continue
+            vcid = validate_conversation_id(str(item))
+            if vcid not in target_ids:
+                target_ids.append(vcid)
+    if not target_ids:
+        raise ValueError("conversation_id or conversation_ids is required.")
+    if len(target_ids) > 50:
+        raise ValueError(f"Too many conversation_ids ({len(target_ids)}); maximum is 50 per call.")
+
+    raw_inc_sub = get_arg(args, "include_subagents", "includeSubagents")
+    include_subagents = bool(raw_inc_sub) if raw_inc_sub is not None else (len(target_ids) == 1)
+
+    app_dir = app_data_dir()
+    catalog = load_model_catalog(app_dir)
+
+    summary_map: dict[str, sqlite3.Row] = {}
+    sub_rows_by_parent: dict[str, list[sqlite3.Row]] = {}
+    try:
+        with open_summaries_db() as conn:
+            placeholders = ", ".join("?" for _ in target_ids)
+            for r in conn.execute(
+                "SELECT conversation_id, title, status, killed, agent_name, nesting_depth, parent_conversation_id "
+                f"FROM conversation_summaries WHERE conversation_id IN ({placeholders})",
+                target_ids,
+            ).fetchall():
+                summary_map[r["conversation_id"].lower()] = r
+            if include_subagents:
+                for sr in conn.execute(
+                    "SELECT conversation_id, title, status, killed, agent_name, nesting_depth, parent_conversation_id "
+                    f"FROM conversation_summaries WHERE parent_conversation_id IN ({placeholders}) "
+                    "ORDER BY last_modified_time ASC",
+                    target_ids,
+                ).fetchall():
+                    pcid = (sr["parent_conversation_id"] or "").lower()
+                    sub_rows_by_parent.setdefault(pcid, []).append(sr)
+    except FileNotFoundError:
+        pass
+
+    parent_role_cache: dict[str, dict[str, dict[str, Any]]] = {}
+    blocks: list[str] = []
+    found_any = False
+
+    for cid in target_ids:
+        sr = summary_map.get(cid)
+        smeta: dict[str, Any] = {}
+        if sr is not None:
+            smeta = {
+                "status": sr["status"],
+                "killed": sr["killed"],
+                "agent_name": sr["agent_name"],
+                "nesting_depth": sr["nesting_depth"],
+                "parent_conversation_id": sr["parent_conversation_id"] or "",
+            }
+        ctx = inspect_conversation_db(cid, app_dir, catalog=catalog, summary_meta=smeta)
+        if ctx is None:
+            if len(target_ids) == 1:
+                raise FileNotFoundError(
+                    f"Conversation database not found for {cid}: {app_dir / 'conversations' / f'{cid}.db'}"
+                )
+            blocks.append(f"Conversation: {cid}\nError: Conversation database not found ({cid}.db)")
+            continue
+
+        found_any = True
+        pcid = ctx["parent_conversation_id"].lower() if ctx["parent_conversation_id"] else ""
+        if pcid and not ctx["role"]:
+            if pcid not in parent_role_cache:
+                parent_role_cache[pcid] = extract_parent_subagent_map(pcid)
+            p_rinfo = parent_role_cache[pcid].get(cid)
+            if p_rinfo:
+                ctx["role"] = p_rinfo.get("role") or ctx["role"]
+                ctx["type_name"] = p_rinfo.get("type") or ctx["type_name"]
+
+        sub_contexts: list[dict[str, Any]] | None = None
+        if include_subagents:
+            spawned_map = ctx.get("spawned_subagents") or {}
+            ordered_subs: list[str] = []
+            sub_smeta_map: dict[str, dict[str, Any]] = {}
+            for sub_r in sub_rows_by_parent.get(cid, []):
+                scid = sub_r["conversation_id"].lower()
+                ordered_subs.append(scid)
+                sp_info = spawned_map.get(scid) or {}
+                sub_smeta_map[scid] = {
+                    "status": sub_r["status"],
+                    "killed": sub_r["killed"],
+                    "agent_name": sub_r["agent_name"],
+                    "nesting_depth": sub_r["nesting_depth"],
+                    "parent_conversation_id": cid,
+                    "role": sp_info.get("role", ""),
+                    "type_name": sp_info.get("type_name", ""),
+                }
+            for scid, sp_info in spawned_map.items():
+                if scid not in sub_smeta_map:
+                    ordered_subs.append(scid)
+                    sub_smeta_map[scid] = {
+                        "parent_conversation_id": cid,
+                        "role": sp_info.get("role", ""),
+                        "type_name": sp_info.get("type_name", ""),
+                    }
+
+            if ordered_subs or raw_inc_sub is True or not pcid:
+                sub_contexts = []
+                for scid in ordered_subs:
+                    s_meta = sub_smeta_map[scid]
+                    s_ctx = inspect_conversation_db(scid, app_dir, catalog=catalog, summary_meta=s_meta)
+                    if s_ctx is None:
+                        sub_contexts.append(
+                            {"conversation_id": scid, "role": s_meta.get("role", ""), "_missing_db": True}
+                        )
+                    else:
+                        sub_contexts.append(s_ctx)
+
+        blocks.append(render_context_report(ctx, sub_contexts))
+
+    if not found_any:
+        raise FileNotFoundError(f"Conversation database(s) not found for: {target_ids}")
+
+    return "\n\n---\n\n".join(blocks)
+
+
 TOOLS = [
     {
         "name": "list_conversations",
-        "description": "List recent Antigravity conversations from conversation_summaries.db, optionally filtered by workspace substring or parent_conversation_id (including subagent roles, turns, tool counts, and duration).",
+        "description": "List recent Antigravity conversations from conversation_summaries.db, optionally filtered by workspace substring or parent_conversation_id (including subagent roles, turns, tool counts, duration, and context budget usage).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1096,6 +1330,28 @@ TOOLS = [
             "required": ["conversation_id"],
         },
     },
+    {
+        "name": "get_conversation_context",
+        "description": "Inspect exact context window usage, 256k compaction budget watermark, per-category token breakdown (user, agent, tool calls, system, rules, skills, MCP tools), and checkpoint compaction status from conversations/<id>.db, optionally including all spawned subagents.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Single conversation UUID to inspect (provide conversation_id or conversation_ids).",
+                },
+                "conversation_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Batch list of conversation UUIDs (e.g. multiple subagents) to inspect in a single call.",
+                },
+                "include_subagents": {
+                    "type": "boolean",
+                    "description": "Include context usage and compaction budget summaries for direct subagents (defaults to true when inspecting a single conversation, false for multi-ID batches).",
+                },
+            },
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -1103,6 +1359,7 @@ TOOL_HANDLERS = {
     "search_conversations": tool_search_conversations,
     "get_conversation_digest": tool_get_conversation_digest,
     "get_conversation_step": tool_get_conversation_step,
+    "get_conversation_context": tool_get_conversation_context,
 }
 
 
@@ -1122,7 +1379,7 @@ def handle_request(msg: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "session-context", "version": "1.1.0"},
+                "serverInfo": {"name": "session-context", "version": "1.2.0"},
             },
         }
 
