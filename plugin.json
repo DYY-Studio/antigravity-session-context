@@ -1,10 +1,11 @@
 {
   "name": "session-context",
   "displayName": "Session Context",
-  "description": "Cross-conversation context lookup and digest MCP server: list, full-text search, and read distilled summaries or specific steps from past conversations without flooding the context window.",
-  "version": "1.1.0",
+  "description": "Cross-conversation context lookup, token budget inspector, and digest MCP server: inspect exact context/compaction budgets (including subagents), list, search, and read distilled summaries or steps from conversations.",
+  "version": "1.2.0",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
+    "Check the context window and 256k compaction budget of this conversation and its subagents",
     "List recent conversations in this workspace",
     "Search past conversations for keywords and summarize the findings",
     "Read the digest of the previous conversation in this repository"
