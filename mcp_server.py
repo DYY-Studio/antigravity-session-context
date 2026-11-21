@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import sys
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -34,7 +35,7 @@ _CACHE_LIMIT = 512
 _DB_CTX_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 _METRICS_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _SUBAGENT_MAP_CACHE: dict[tuple[str, int, int], dict[str, dict[str, Any]]] = {}
-_CATALOG_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_CATALOG_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 
 
 def _cache_put(cache: dict[Any, Any], key: Any, val: Any, limit: int = _CACHE_LIMIT) -> None:
@@ -46,32 +47,33 @@ def _cache_put(cache: dict[Any, Any], key: Any, val: Any, limit: int = _CACHE_LI
 def _file_stat_key(path: Path) -> tuple[int, int] | None:
     try:
         st = path.stat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
         return (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
 
 
-def _cached_model_catalog(app_dir: Path) -> dict[str, Any]:
+def _load_cached_catalog(app_dir: Path) -> tuple[dict[str, Any], tuple[Any, ...]]:
     env_cat = os.environ.get("ANTIGRAVITY_MODEL_CATALOG")
-    cand = Path(env_cat).expanduser() if env_cat else (
-        app_dir / "sidecar_data" / "desktop-context" / "context" / "data" / "model-catalog.json"
-    )
-    st = _file_stat_key(cand)
-    if st is not None:
-        ckey = (str(cand), st[0], st[1])
-        cached = _CATALOG_CACHE.get(ckey)
-        if cached is not None:
-            return cached
-        data = load_model_catalog(app_dir)
-        _cache_put(_CATALOG_CACHE, ckey, data, limit=16)
-        return data
-    return load_model_catalog(app_dir)
+    candidates: list[Path] = []
+    if env_cat:
+        candidates.append(Path(env_cat).expanduser())
+    candidates.append(app_dir / "sidecar_data" / "desktop-context" / "context" / "data" / "model-catalog.json")
+    ckey = tuple((str(p), _file_stat_key(p)) for p in candidates)
+    cached = _CATALOG_CACHE.get(ckey)
+    if cached is not None:
+        return cached, ckey
+    data = load_model_catalog(app_dir)
+    _cache_put(_CATALOG_CACHE, ckey, data, limit=16)
+    return data, ckey
 
 
 def _cached_inspect_db(
     cid: str,
     app_dir: Path,
     catalog: dict[str, Any] | None = None,
+    catalog_key: Any = None,
     summary_meta: dict[str, Any] | None = None,
     include_spawned: bool = True,
 ) -> dict[str, Any] | None:
@@ -79,9 +81,19 @@ def _cached_inspect_db(
     db_st = _file_stat_key(db_path)
     if db_st is None:
         return None
+    if catalog is None:
+        catalog, catalog_key = _load_cached_catalog(app_dir)
+    elif catalog_key is None:
+        return inspect_conversation_db(
+            cid,
+            app_dir,
+            catalog=catalog,
+            summary_meta=summary_meta,
+            include_spawned=include_spawned,
+        )
     wal_st = _file_stat_key(db_path.with_name(f"{cid}.db-wal"))
     smeta_key = tuple(sorted((k, v) for k, v in (summary_meta or {}).items()))
-    ckey = (cid, include_spawned, db_st, wal_st, smeta_key)
+    ckey = (str(db_path), include_spawned, db_st, wal_st, smeta_key, catalog_key)
     if ckey in _DB_CTX_CACHE:
         cached = _DB_CTX_CACHE[ckey]
         return dict(cached) if cached is not None else None
@@ -308,7 +320,7 @@ def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
     st = _file_stat_key(transcript_path)
     if st is None:
         return {}
-    ckey = (parent_cid, st[0], st[1])
+    ckey = (str(transcript_path), st[0], st[1])
     cached = _SUBAGENT_MAP_CACHE.get(ckey)
     if cached is not None:
         return cached
@@ -351,7 +363,7 @@ def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
                     pending_calls = []
                     generic_offset = 0
     except Exception:
-        pass
+        return mapping
     _cache_put(_SUBAGENT_MAP_CACHE, ckey, mapping)
     return mapping
 
@@ -362,7 +374,7 @@ def compute_transcript_metrics(cid: str) -> dict[str, Any]:
     st = _file_stat_key(transcript_path)
     if st is None:
         return {}
-    ckey = (cid, st[0], st[1])
+    ckey = (str(transcript_path), st[0], st[1])
     cached = _METRICS_CACHE.get(ckey)
     if cached is not None:
         return cached
@@ -371,7 +383,7 @@ def compute_transcript_metrics(cid: str) -> dict[str, Any]:
     turns = 0
     tools = 0
     first_ts = ""
-    last_ts_head = ""
+    last_ts = ""
     try:
         with transcript_path.open(encoding="utf-8") as f:
             for line in f:
@@ -379,36 +391,44 @@ def compute_transcript_metrics(cid: str) -> dict[str, Any]:
                     continue
                 steps += 1
                 head = line[:300]
-                if '"created_at"' in head:
-                    if not first_ts:
-                        cm = CREATED_AT_RE.search(head)
-                        if cm and cm.group(1):
-                            first_ts = cm.group(1)
-                    last_ts_head = head
-                tm = TYPE_FIELD_RE.search(head)
-                if tm is not None:
-                    if tm.group(1) == "PLANNER_RESPONSE":
-                        turns += 1
-                        if '"tool_calls"' in line:
-                            obj = json.loads(line)
-                            tools += len(obj.get("tool_calls") or [])
-                else:
+                std_order = STEP_INDEX_PREFIX_RE.match(head) is not None
+                obj: dict[str, Any] | None = None
+
+                created = ""
+                if std_order and '"created_at"' in head:
+                    cm = CREATED_AT_RE.search(head)
+                    if cm is not None:
+                        created = cm.group(1)
+                    else:
+                        obj = json.loads(line)
+                        created = obj.get("created_at") or ""
+                elif '"created_at"' in line:
                     obj = json.loads(line)
                     created = obj.get("created_at") or ""
-                    if created:
-                        if not first_ts:
-                            first_ts = created
-                        last_ts_head = f'"created_at":"{created}"'
+                if created:
+                    if not first_ts:
+                        first_ts = created
+                    last_ts = created
+
+                if obj is not None:
                     if obj.get("type") == "PLANNER_RESPONSE":
                         turns += 1
                         tools += len(obj.get("tool_calls") or [])
+                else:
+                    tm = TYPE_FIELD_RE.search(head) if std_order else None
+                    if tm is not None:
+                        if tm.group(1) == "PLANNER_RESPONSE":
+                            turns += 1
+                            if '"tool_calls"' in line:
+                                obj = json.loads(line)
+                                tools += len(obj.get("tool_calls") or [])
+                    else:
+                        obj = json.loads(line)
+                        if obj.get("type") == "PLANNER_RESPONSE":
+                            turns += 1
+                            tools += len(obj.get("tool_calls") or [])
     except Exception:
         return {}
-    last_ts = ""
-    if last_ts_head:
-        cm = CREATED_AT_RE.search(last_ts_head)
-        if cm:
-            last_ts = cm.group(1)
     t0 = parse_iso_ts(first_ts)
     t1 = parse_iso_ts(last_ts)
     dur_sec = (t1 - t0).total_seconds() if (t0 and t1) else None
@@ -498,6 +518,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
 
     app_dir = app_data_dir()
     catalog: dict[str, Any] | None = None
+    catalog_key: Any = None
     parent_role_cache: dict[str, dict[str, dict[str, Any]]] = {}
     lines = [f"Found {len(rows)} conversation(s):"]
     for r in rows:
@@ -508,7 +529,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
         sub_ctx: dict[str, Any] | None = None
         if parent_cid:
             if catalog is None:
-                catalog = _cached_model_catalog(app_dir)
+                catalog, catalog_key = _load_cached_catalog(app_dir)
             if not title:
                 if parent_cid not in parent_role_cache:
                     parent_role_cache[parent_cid] = extract_parent_subagent_map(parent_cid)
@@ -517,6 +538,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
                 cid,
                 app_dir,
                 catalog=catalog,
+                catalog_key=catalog_key,
                 summary_meta={
                     "status": r["status"],
                     "killed": r["killed"],
@@ -612,8 +634,7 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
 
     tokens = [t.lower() for t in re.split(r"[\s|]+", raw_q) if t]
     is_or = "|" in raw_q
-    can_raw_filter = all(not any(c in t for c in ("\\", '"', "\n", "\r", "\t")) for t in tokens)
-    all_ascii = all(t.isascii() for t in tokens)
+    can_raw_filter = all(all(ord(c) >= 0x20 and c not in ("\\", '"') for c in t) for t in tokens)
     all_matches: list[int] = []
     any_matches: list[int] = []
     try:
@@ -621,10 +642,12 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
             for line in f:
                 if not line.strip():
                     continue
-                tm = TYPE_FIELD_RE.search(line[:260])
-                if tm is not None and tm.group(1) not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
-                    continue
-                if can_raw_filter and (all_ascii or "\\u" not in line):
+                head = line[:260]
+                if STEP_INDEX_PREFIX_RE.match(head) is not None:
+                    tm = TYPE_FIELD_RE.search(head)
+                    if tm is not None and tm.group(1) not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
+                        continue
+                if can_raw_filter and "\\u" not in line and "\\/" not in line:
                     low_raw = line.lower()
                     if not any(t in low_raw for t in tokens):
                         continue
@@ -749,26 +772,43 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[str, Any]]:
+def _load_full_steps_all(full_path: Path, step_indices: set[int]) -> dict[int, list[dict[str, Any]]]:
     if not step_indices or not full_path.is_file():
         return {}
-    found: dict[int, dict[str, Any]] = {}
+    found: dict[int, list[dict[str, Any]]] = {}
     with full_path.open(encoding="utf-8") as f:
         for line in f:
             m = STEP_INDEX_PREFIX_RE.match(line)
-            if m is not None:
-                if int(m.group(1)) not in step_indices:
-                    continue
+            if m is not None and int(m.group(1)) not in step_indices:
+                continue
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
             idx = obj.get("step_index")
             if idx in step_indices:
-                found[idx] = obj
-                if len(found) == len(step_indices):
-                    break
+                found.setdefault(idx, []).append(obj)
     return found
+
+
+def _resolve_full_step(obj: dict[str, Any], full_lists: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
+    idx = obj.get("step_index")
+    cands = full_lists.get(idx) if idx is not None else None
+    if not cands:
+        return obj
+    stype = obj.get("type")
+    created = obj.get("created_at")
+    for c in reversed(cands):
+        if c.get("type") == stype and c.get("created_at") == created:
+            return c
+    for c in reversed(cands):
+        if c.get("type") == stype:
+            return c
+    return obj
+
+
+def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[str, Any]]:
+    return {idx: items[-1] for idx, items in _load_full_steps_all(full_path, step_indices).items()}
 
 
 def _render_digest_step(
@@ -963,7 +1003,10 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         f"({total_file_steps} steps, turns={total_turns}, tools={total_tools}{dur_part})"
     )
     app_dir = app_data_dir()
-    catalog = _cached_model_catalog(app_dir) if (not is_scoped or include_subagents) else None
+    if not is_scoped or include_subagents:
+        catalog, catalog_key = _load_cached_catalog(app_dir)
+    else:
+        catalog, catalog_key = None, None
     meta_line = f"Conversation: {cid}\nStep range: {step_range_str}"
     subagents: list[str] = []
     subagent_total = 0
@@ -984,6 +1027,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                         cid,
                         app_dir,
                         catalog=catalog,
+                        catalog_key=catalog_key,
                         summary_meta={
                             "status": row["status"],
                             "killed": row["killed"],
@@ -1019,7 +1063,9 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                     f"Workspace: {ws}"
                 )
             elif not is_scoped:
-                self_ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, include_spawned=False)
+                self_ctx = _cached_inspect_db(
+                    cid, app_dir, catalog=catalog, catalog_key=catalog_key, include_spawned=False
+                )
                 ctx_line = (
                     f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
                     if self_ctx is not None
@@ -1042,6 +1088,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                         scid,
                         app_dir,
                         catalog=catalog,
+                        catalog_key=catalog_key,
                         summary_meta={
                             "status": sr["status"],
                             "killed": sr["killed"],
@@ -1067,7 +1114,9 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                         subagents.append(f"{scid}{role_part} (steps={sr['step_count']} | {ctx_tag})")
     except FileNotFoundError:
         if not is_scoped:
-            self_ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, include_spawned=False)
+            self_ctx = _cached_inspect_db(
+                cid, app_dir, catalog=catalog, catalog_key=catalog_key, include_spawned=False
+            )
             ctx_line = (
                 f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
                 if self_ctx is not None
@@ -1093,13 +1142,16 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     parsed_query = _parse_step_query(raw_query) if has_query else None
     budget = max(1000, max_chars - len(header_text) - 220)
 
-    def _render_window(window_steps: list[dict[str, Any]], full_map: dict[int, dict[str, Any]]) -> list[tuple[int, str]]:
+    def _render_window(
+        window_steps: list[dict[str, Any]],
+        full_lists: dict[int, list[dict[str, Any]]],
+    ) -> list[tuple[int, str]]:
         out: list[tuple[int, str]] = []
         ask_pending = False
         for obj in window_steps:
             idx = obj.get("step_index", 0)
-            if idx in full_map and full_map[idx].get("type") == obj.get("type"):
-                obj = full_map[idx]
+            if idx in full_lists:
+                obj = _resolve_full_step(obj, full_lists)
             block, ask_pending = _render_digest_step(
                 obj,
                 include_tools=include_tools,
@@ -1123,8 +1175,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         target_est = budget + 4000
         for pos in range(len(steps) - 1, -1, -1):
             obj = steps[pos]
-            stype = obj.get("type")
-            if stype == "GENERIC":
+            if obj.get("type") == "GENERIC":
                 continue
             block, _ = _render_digest_step(
                 obj,
@@ -1144,17 +1195,29 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 if est_kept >= 2 and est_used > target_est:
                     tail_start = pos
                     break
-        while tail_start > 0 and steps[tail_start].get("type") == "GENERIC":
-            tail_start -= 1
+        if tail_start > 0:
+            for prev_pos in range(tail_start - 1, -1, -1):
+                prev = steps[prev_pos]
+                ptype = prev.get("type")
+                if ptype in ("USER_INPUT", "GENERIC"):
+                    break
+                if ptype == "PLANNER_RESPONSE":
+                    ptcalls = prev.get("tool_calls") or []
+                    ptrunc = prev.get("truncated_fields") or ()
+                    if any(tc.get("name") == "ask_question" for tc in ptcalls) or "tool_calls" in ptrunc:
+                        tail_start = prev_pos
+                    break
 
     window_steps = steps[tail_start:] if tail_start > 0 else steps
     window_need_full = need_full & {s.get("step_index", 0) for s in window_steps} if tail_start > 0 else need_full
-    full_map = load_full_steps(full_path, window_need_full)
-    rendered_steps = _render_window(window_steps, full_map)
+    full_lists = _load_full_steps_all(full_path, window_need_full)
+    rendered_steps = _render_window(window_steps, full_lists)
 
-    if tail_start > 0 and sum(len(b) + 1 for _, b in rendered_steps) <= budget:
-        full_map = load_full_steps(full_path, need_full)
-        rendered_steps = _render_window(steps, full_map)
+    if tail_start > 0:
+        tail_body_len = sum(len(b) for _, b in rendered_steps) + max(0, len(rendered_steps) - 1)
+        if len(header_text) + 1 + tail_body_len <= max_chars or (tail_body_len + 1) <= budget:
+            full_lists = _load_full_steps_all(full_path, need_full)
+            rendered_steps = _render_window(steps, full_lists)
 
     if has_query and not rendered_steps:
         return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_step or (max_file_idx or 0)}."
@@ -1230,9 +1293,8 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
     with chosen_path.open(encoding="utf-8") as f:
         for line in f:
             m = STEP_INDEX_PREFIX_RE.match(line)
-            if m is not None:
-                if int(m.group(1)) not in target_set:
-                    continue
+            if m is not None and int(m.group(1)) not in target_set:
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -1240,8 +1302,6 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
             idx = obj.get("step_index")
             if idx in target_set:
                 found_map[idx] = obj
-                if len(found_map) == len(target_set):
-                    break
 
     missing = [i for i in target_list if i not in found_map]
     if len(missing) == len(target_list):
@@ -1252,18 +1312,19 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
         for idx, obj in found_map.items()
         if ((obj.get("truncated_fields") or obj.get("tool_calls")) and not use_full and full_path.is_file())
     }
-    upgraded_map = load_full_steps(full_path, need_upgrade) if need_upgrade else {}
+    upgraded_lists = _load_full_steps_all(full_path, need_upgrade) if need_upgrade else {}
 
     blocks: list[str] = []
     for idx in target_list:
         if idx not in found_map:
             blocks.append(f"Source: {chosen_path.name} | step_index={idx} | NOT FOUND")
             continue
-        if idx in upgraded_map:
-            obj = upgraded_map[idx]
-            src_note = "transcript_full.jsonl"
+        base_obj = found_map[idx]
+        if idx in upgraded_lists:
+            obj = _resolve_full_step(base_obj, upgraded_lists)
+            src_note = "transcript_full.jsonl" if obj is not base_obj else chosen_path.name
         else:
-            obj = found_map[idx]
+            obj = base_obj
             src_note = chosen_path.name
         formatted = json.dumps(obj, ensure_ascii=False, indent=2)
         blocks.append(f"Source: {src_note} | step_index={idx} | chars={len(formatted)}\n{formatted}")
@@ -1300,7 +1361,7 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
     include_subagents = bool(raw_inc_sub) if raw_inc_sub is not None else (len(target_ids) == 1)
 
     app_dir = app_data_dir()
-    catalog = _cached_model_catalog(app_dir)
+    catalog, catalog_key = _load_cached_catalog(app_dir)
 
     summary_map: dict[str, sqlite3.Row] = {}
     sub_rows_by_parent: dict[str, list[sqlite3.Row]] = {}
@@ -1340,7 +1401,14 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
                 "nesting_depth": sr["nesting_depth"],
                 "parent_conversation_id": sr["parent_conversation_id"] or "",
             }
-        ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, summary_meta=smeta, include_spawned=include_subagents)
+        ctx = _cached_inspect_db(
+            cid,
+            app_dir,
+            catalog=catalog,
+            catalog_key=catalog_key,
+            summary_meta=smeta,
+            include_spawned=include_subagents,
+        )
         if ctx is None:
             if len(target_ids) == 1:
                 raise FileNotFoundError(
@@ -1391,7 +1459,12 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
                 for scid in ordered_subs:
                     s_meta = sub_smeta_map[scid]
                     s_ctx = _cached_inspect_db(
-                        scid, app_dir, catalog=catalog, summary_meta=s_meta, include_spawned=False
+                        scid,
+                        app_dir,
+                        catalog=catalog,
+                        catalog_key=catalog_key,
+                        summary_meta=s_meta,
+                        include_spawned=False,
                     )
                     if s_ctx is None:
                         sub_contexts.append(

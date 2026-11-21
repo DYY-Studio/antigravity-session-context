@@ -147,7 +147,6 @@ def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
 _GEN_FIELDS = frozenset((1, 3))
 _CHAT_FIELDS = frozenset((4, 9, 19, 21))
 _PLANNER_FIELDS = frozenset((28,))
-_MD_USAGE_FIELDS = frozenset((9,))
 _MD_TC_FIELDS = frozenset((4,))
 
 
@@ -230,8 +229,8 @@ class Msg:
         self._msg_cache[key] = res
         return res
 
-    def msgs(self, fn: int, wanted: frozenset[int] | None = None) -> list["Msg"]:
-        return [Msg(v, wanted) for v in self.fields.get(fn, []) if isinstance(v, bytes)]
+    def msgs(self, fn: int) -> list["Msg"]:
+        return [Msg(v) for v in self.fields.get(fn, []) if isinstance(v, bytes)]
 
 
 def fmt_tok(n: int) -> str:
@@ -411,7 +410,7 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
         left, sep, right = it.str(1).partition(": ")
         if not sep or right not in STEP_TYPES:
             return False, [0, 0, 0, 0]
-        digits = left[1:] if left[:1] in "+-" else left
+        digits = left[1:] if left[:1] in ("+", "-") else left
         if not digits or not digits.isascii() or not digits.isdigit():
             return False, [0, 0, 0, 0]
         cat = step_category(STEP_TYPES[right])
@@ -784,11 +783,16 @@ def _has_category_breakdown(gen: Msg | None) -> bool:
     breakdown = cwm.msg(3) if cwm is not None else None
     if breakdown is None:
         return False
+    chat_tok = 0
+    chat_group: Msg | None = None
     for g in breakdown.msgs(1):
-        if g.int(2) == TOKEN_CHAT_MESSAGES and g.int(4, signed32=True):
-            ok, _ = chat_tokens_by_category(g.msgs(5))
-            return ok
-    return False
+        if g.int(2) == TOKEN_CHAT_MESSAGES:
+            chat_tok = g.int(4, signed32=True)
+            chat_group = g
+    if not chat_tok or chat_group is None:
+        return False
+    ok, _ = chat_tokens_by_category(chat_group.msgs(5))
+    return ok
 
 
 def inspect_conversation_db(
@@ -809,6 +813,10 @@ def inspect_conversation_db(
     term_reason_code = 0
     term_step_idx = -1
     try:
+        try:
+            conn.execute("BEGIN")
+        except sqlite3.Error:
+            pass
         gen_row = conn.execute("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").fetchone()
         gen = Msg(gen_row[0], _GEN_FIELDS) if (gen_row and gen_row[0]) else None
         try:
@@ -864,7 +872,9 @@ def inspect_conversation_db(
         )
 
         use_fast = (step_count == 0) or (
-            _has_category_breakdown(gen) and last_row is not None and last_row[3] is not None
+            _has_category_breakdown(gen)
+            and last_row is not None
+            and conn.execute("SELECT 1 FROM steps WHERE metadata IS NULL LIMIT 1").fetchone() is None
         )
         st: dict[str, Any] | None = None
         budget_used = 0
@@ -894,13 +904,16 @@ def inspect_conversation_db(
 
                 has_newer = False
                 if last_done_ckpt_step is not None:
-                    has_planner_after = (
-                        conn.execute(
-                            "SELECT 1 FROM steps WHERE idx > ? AND step_type = 15 AND status = ? LIMIT 1",
-                            (last_done_ckpt_sql_idx, STATUS_DONE),
-                        ).fetchone()
-                        is not None
-                    )
+                    has_planner_after = False
+                    for r in conn.execute(
+                        "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                        "WHERE idx > ? AND step_type = 15 AND status = ? ORDER BY idx DESC",
+                        (last_done_ckpt_sql_idx, STATUS_DONE),
+                    ):
+                        ps = Step(0, r[4] or b"", r[1], r[2], r[3])
+                        if ps.payload(STEP_PLANNER_RESPONSE) is not None and ps.status == STATUS_DONE:
+                            has_planner_after = True
+                            break
                     if not has_planner_after:
                         chat = _gen_chat(gen)
                         chat_start = chat.msg(9) if chat is not None else None
@@ -927,18 +940,20 @@ def inspect_conversation_db(
                     st = collect_stats(ckpt_steps, gen, limit, newer_override=(-1, None))
                     pos_planner_sql_idx = -1
                     prefix_tok = 0
-                    for r_idx, r_meta in conn.execute(
-                        "SELECT idx, metadata FROM steps WHERE step_type = 15 AND idx > ? ORDER BY idx DESC",
+                    for r in conn.execute(
+                        "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                        "WHERE step_type = 15 AND idx > ? ORDER BY idx DESC",
                         (last_done_ckpt_sql_idx,),
                     ):
-                        if not r_meta:
+                        ps = Step(0, r[4] or b"", r[1], r[2], r[3])
+                        if ps.payload(STEP_PLANNER_RESPONSE) is None:
                             continue
-                        u = Msg(r_meta, _MD_USAGE_FIELDS).msg(9)
+                        u = ps.md.msg(9)
                         if u is None:
                             continue
                         inp, out_tok, cache_r, cache_w = u.int(2), u.int(3), u.int(5), u.int(6)
                         if inp + cache_r + cache_w > 0:
-                            pos_planner_sql_idx = r_idx
+                            pos_planner_sql_idx = r[0]
                             prefix_tok = inp + cache_r + cache_w + out_tok
                             break
                     if pos_planner_sql_idx >= 0:
@@ -988,6 +1003,10 @@ def inspect_conversation_db(
             has_reported_override = None
             spawned = extract_spawned_subagents(steps) if include_spawned else {}
     finally:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
         conn.close()
 
     if raw_req_budget > 0:
