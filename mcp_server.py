@@ -26,6 +26,74 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 MSG_HEADER_RE = re.compile(r"^\[Message\]\s+timestamp=\S+\s+sender=(\S+)\s+priority=\S+\s+content=(.*)", re.DOTALL)
 SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-fA-F-]{36})"')
+STEP_INDEX_PREFIX_RE = re.compile(r'^\s*\{\s*"step_index"\s*:\s*(\d+)')
+TYPE_FIELD_RE = re.compile(r'"type"\s*:\s*"([A-Z_]+)"')
+CREATED_AT_RE = re.compile(r'"created_at"\s*:\s*"([^"]*)"')
+
+_CACHE_LIMIT = 512
+_DB_CTX_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
+_METRICS_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+_SUBAGENT_MAP_CACHE: dict[tuple[str, int, int], dict[str, dict[str, Any]]] = {}
+_CATALOG_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
+
+
+def _cache_put(cache: dict[Any, Any], key: Any, val: Any, limit: int = _CACHE_LIMIT) -> None:
+    if len(cache) >= limit and key not in cache:
+        cache.pop(next(iter(cache)))
+    cache[key] = val
+
+
+def _file_stat_key(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _cached_model_catalog(app_dir: Path) -> dict[str, Any]:
+    env_cat = os.environ.get("ANTIGRAVITY_MODEL_CATALOG")
+    cand = Path(env_cat).expanduser() if env_cat else (
+        app_dir / "sidecar_data" / "desktop-context" / "context" / "data" / "model-catalog.json"
+    )
+    st = _file_stat_key(cand)
+    if st is not None:
+        ckey = (str(cand), st[0], st[1])
+        cached = _CATALOG_CACHE.get(ckey)
+        if cached is not None:
+            return cached
+        data = load_model_catalog(app_dir)
+        _cache_put(_CATALOG_CACHE, ckey, data, limit=16)
+        return data
+    return load_model_catalog(app_dir)
+
+
+def _cached_inspect_db(
+    cid: str,
+    app_dir: Path,
+    catalog: dict[str, Any] | None = None,
+    summary_meta: dict[str, Any] | None = None,
+    include_spawned: bool = True,
+) -> dict[str, Any] | None:
+    db_path = app_dir / "conversations" / f"{cid}.db"
+    db_st = _file_stat_key(db_path)
+    if db_st is None:
+        return None
+    wal_st = _file_stat_key(db_path.with_name(f"{cid}.db-wal"))
+    smeta_key = tuple(sorted((k, v) for k, v in (summary_meta or {}).items()))
+    ckey = (cid, include_spawned, db_st, wal_st, smeta_key)
+    if ckey in _DB_CTX_CACHE:
+        cached = _DB_CTX_CACHE[ckey]
+        return dict(cached) if cached is not None else None
+    res = inspect_conversation_db(
+        cid,
+        app_dir,
+        catalog=catalog,
+        summary_meta=summary_meta,
+        include_spawned=include_spawned,
+    )
+    _cache_put(_DB_CTX_CACHE, ckey, res)
+    return dict(res) if res is not None else None
 
 
 def app_data_dir() -> Path:
@@ -237,8 +305,14 @@ def _parse_subagent_invocation(tc: dict[str, Any], generic_content: str, invoke_
 def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
     """Map subagent conversation_id -> {role, type, model, invoke_step} from parent transcript."""
     transcript_path = app_data_dir() / "brain" / parent_cid / ".system_generated" / "logs" / "transcript.jsonl"
-    if not transcript_path.is_file():
+    st = _file_stat_key(transcript_path)
+    if st is None:
         return {}
+    ckey = (parent_cid, st[0], st[1])
+    cached = _SUBAGENT_MAP_CACHE.get(ckey)
+    if cached is not None:
+        return cached
+
     mapping: dict[str, dict[str, Any]] = {}
     pending_calls: list[dict[str, Any]] = []
     generic_offset = 0
@@ -246,6 +320,8 @@ def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
     try:
         with transcript_path.open(encoding="utf-8") as f:
             for line in f:
+                if not pending_calls and '"invoke_subagent"' not in line:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -253,9 +329,14 @@ def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
                 stype = obj.get("type")
                 idx = obj.get("step_index", 0)
                 if stype == "PLANNER_RESPONSE":
-                    pending_calls = obj.get("tool_calls") or []
-                    generic_offset = 0
-                    pending_step = idx
+                    tcalls = obj.get("tool_calls") or []
+                    if any(tc.get("name") == "invoke_subagent" for tc in tcalls):
+                        pending_calls = tcalls
+                        generic_offset = 0
+                        pending_step = idx
+                    else:
+                        pending_calls = []
+                        generic_offset = 0
                 elif stype == "GENERIC" and pending_calls:
                     if generic_offset < len(pending_calls):
                         parsed = _parse_subagent_invocation(
@@ -264,52 +345,82 @@ def extract_parent_subagent_map(parent_cid: str) -> dict[str, dict[str, Any]]:
                         if parsed:
                             mapping[parsed[0]] = parsed[1]
                     generic_offset += 1
+                    if generic_offset >= len(pending_calls):
+                        pending_calls = []
                 else:
                     pending_calls = []
                     generic_offset = 0
     except Exception:
         pass
+    _cache_put(_SUBAGENT_MAP_CACHE, ckey, mapping)
     return mapping
 
 
 def compute_transcript_metrics(cid: str) -> dict[str, Any]:
     """Compute step count, planner turns, tool call count, and wall-clock duration from transcript.jsonl."""
     transcript_path = app_data_dir() / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
-    if not transcript_path.is_file():
+    st = _file_stat_key(transcript_path)
+    if st is None:
         return {}
+    ckey = (cid, st[0], st[1])
+    cached = _METRICS_CACHE.get(ckey)
+    if cached is not None:
+        return cached
+
     steps = 0
     turns = 0
     tools = 0
-    first_ts: str = ""
-    last_ts: str = ""
+    first_ts = ""
+    last_ts_head = ""
     try:
         with transcript_path.open(encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
-                obj = json.loads(line)
                 steps += 1
-                created = obj.get("created_at") or ""
-                if created:
+                head = line[:300]
+                if '"created_at"' in head:
                     if not first_ts:
-                        first_ts = created
-                    last_ts = created
-                if obj.get("type") == "PLANNER_RESPONSE":
-                    turns += 1
-                    tools += len(obj.get("tool_calls") or [])
+                        cm = CREATED_AT_RE.search(head)
+                        if cm and cm.group(1):
+                            first_ts = cm.group(1)
+                    last_ts_head = head
+                tm = TYPE_FIELD_RE.search(head)
+                if tm is not None:
+                    if tm.group(1) == "PLANNER_RESPONSE":
+                        turns += 1
+                        if '"tool_calls"' in line:
+                            obj = json.loads(line)
+                            tools += len(obj.get("tool_calls") or [])
+                else:
+                    obj = json.loads(line)
+                    created = obj.get("created_at") or ""
+                    if created:
+                        if not first_ts:
+                            first_ts = created
+                        last_ts_head = f'"created_at":"{created}"'
+                    if obj.get("type") == "PLANNER_RESPONSE":
+                        turns += 1
+                        tools += len(obj.get("tool_calls") or [])
     except Exception:
         return {}
+    last_ts = ""
+    if last_ts_head:
+        cm = CREATED_AT_RE.search(last_ts_head)
+        if cm:
+            last_ts = cm.group(1)
     t0 = parse_iso_ts(first_ts)
     t1 = parse_iso_ts(last_ts)
     dur_sec = (t1 - t0).total_seconds() if (t0 and t1) else None
-    return {
+    res = {
         "steps": steps,
         "turns": turns,
         "tools": tools,
         "duration_sec": dur_sec,
         "duration": format_duration(dur_sec),
     }
+    _cache_put(_METRICS_CACHE, ckey, res)
+    return res
 
 
 def format_subagent_role_tag(role_info: dict[str, Any] | None, ctx: dict[str, Any] | None = None) -> str:
@@ -397,12 +508,12 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
         sub_ctx: dict[str, Any] | None = None
         if parent_cid:
             if catalog is None:
-                catalog = load_model_catalog(app_dir)
+                catalog = _cached_model_catalog(app_dir)
             if not title:
                 if parent_cid not in parent_role_cache:
                     parent_role_cache[parent_cid] = extract_parent_subagent_map(parent_cid)
                 rinfo = parent_role_cache[parent_cid].get(cid.lower())
-            sub_ctx = inspect_conversation_db(
+            sub_ctx = _cached_inspect_db(
                 cid,
                 app_dir,
                 catalog=catalog,
@@ -415,6 +526,7 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
                     "role": (rinfo or {}).get("role", ""),
                     "type_name": (rinfo or {}).get("type", ""),
                 },
+                include_spawned=False,
             )
             if not title:
                 role_label = format_subagent_role_tag(rinfo, sub_ctx)
@@ -453,29 +565,37 @@ def build_fts_query(raw_query: str) -> str:
     return " ".join(escaped)
 
 
-def match_query_in_step(obj: dict[str, Any], raw_query: str) -> tuple[bool, bool]:
-    """Return (matched, matched_in_thinking) for a step object against raw_query."""
+def _parse_step_query(raw_query: str) -> tuple[bool, list[str]]:
     q = (raw_query or "").strip().lower()
     if not q:
+        return False, []
+    if "|" in q:
+        return True, [b.strip() for b in q.split("|") if b.strip()]
+    return False, [t for t in q.split() if t]
+
+
+def match_query_in_step(
+    obj: dict[str, Any],
+    raw_query: str,
+    parsed: tuple[bool, list[str]] | None = None,
+) -> tuple[bool, bool]:
+    """Return (matched, matched_in_thinking) for a step object against raw_query."""
+    is_or, terms = parsed if parsed is not None else _parse_step_query(raw_query)
+    if not terms:
         return True, False
     content_hay = (obj.get("content") or "").lower()
     thinking_hay = (obj.get("thinking") or "").lower()
-    tools_hay = json.dumps(obj.get("tool_calls") or [], ensure_ascii=False).lower()
+    tcalls = obj.get("tool_calls")
+    tools_hay = json.dumps(tcalls, ensure_ascii=False).lower() if tcalls else ""
     combined = f"{content_hay} {thinking_hay} {tools_hay}"
 
-    if "|" in q:
-        branches = [b.strip() for b in q.split("|") if b.strip()]
-        if not branches:
-            return True, False
-        matched = any(b in combined for b in branches)
-        in_thinking = any(b in thinking_hay for b in branches)
+    if is_or:
+        matched = any(b in combined for b in terms)
+        in_thinking = any(b in thinking_hay for b in terms)
         return matched, in_thinking
 
-    tokens = [t for t in re.split(r"\s+", q) if t]
-    if not tokens:
-        return True, False
-    matched = all(t in combined for t in tokens)
-    in_thinking = any(t in thinking_hay for t in tokens)
+    matched = all(t in combined for t in terms)
+    in_thinking = any(t in thinking_hay for t in terms)
     return matched, in_thinking
 
 
@@ -492,14 +612,22 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
 
     tokens = [t.lower() for t in re.split(r"[\s|]+", raw_q) if t]
     is_or = "|" in raw_q
+    can_raw_filter = all(not any(c in t for c in ("\\", '"', "\n", "\r", "\t")) for t in tokens)
+    all_ascii = all(t.isascii() for t in tokens)
     all_matches: list[int] = []
     any_matches: list[int] = []
     try:
         with chosen_path.open(encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
+                tm = TYPE_FIELD_RE.search(line[:260])
+                if tm is not None and tm.group(1) not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
+                    continue
+                if can_raw_filter and (all_ascii or "\\u" not in line):
+                    low_raw = line.lower()
+                    if not any(t in low_raw for t in tokens):
+                        continue
                 obj = json.loads(line)
                 stype = obj.get("type")
                 if stype not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
@@ -507,13 +635,9 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
                 idx = obj.get("step_index")
                 if idx is None:
                     continue
-                hay = (
-                    (obj.get("content") or "")
-                    + " "
-                    + (obj.get("thinking") or "")
-                    + " "
-                    + json.dumps(obj.get("tool_calls") or [], ensure_ascii=False)
-                ).lower()
+                tcalls = obj.get("tool_calls")
+                tools_str = json.dumps(tcalls, ensure_ascii=False) if tcalls else ""
+                hay = ((obj.get("content") or "") + " " + (obj.get("thinking") or "") + " " + tools_str).lower()
                 if not is_or and all(t in hay for t in tokens):
                     all_matches.append(idx)
                 elif any(t in hay for t in tokens):
@@ -631,6 +755,10 @@ def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[s
     found: dict[int, dict[str, Any]] = {}
     with full_path.open(encoding="utf-8") as f:
         for line in f:
+            m = STEP_INDEX_PREFIX_RE.match(line)
+            if m is not None:
+                if int(m.group(1)) not in step_indices:
+                    continue
             line = line.strip()
             if not line:
                 continue
@@ -641,6 +769,92 @@ def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[s
                 if len(found) == len(step_indices):
                     break
     return found
+
+
+def _render_digest_step(
+    obj: dict[str, Any],
+    *,
+    include_tools: bool,
+    include_thinking: bool,
+    include_system: bool,
+    has_query: bool,
+    raw_query: str,
+    parsed_query: tuple[bool, list[str]] | None,
+    planner_result_steps: dict[int, list[int]],
+    result_step_subagent: dict[int, str],
+    ask_question_pending: bool,
+) -> tuple[str | None, bool]:
+    """Render one digest step and return (rendered_block_or_None, next_ask_question_pending)."""
+    idx = obj.get("step_index", 0)
+    stype = obj.get("type")
+    created = obj.get("created_at", "")
+
+    if stype == "USER_INPUT":
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
+            return None, False
+        text = extract_user_text(obj.get("content", ""))
+        return f"\n[Step {idx} | USER | {created}]\n{text}", False
+
+    if stype == "PLANNER_RESPONSE":
+        tcalls = obj.get("tool_calls") or []
+        next_ask = any(tc.get("name") == "ask_question" for tc in tcalls)
+        matched_query, matched_in_thinking = (
+            match_query_in_step(obj, raw_query, parsed_query) if has_query else (True, False)
+        )
+        if not matched_query:
+            return None, next_ask
+        parts = []
+        if (include_thinking or matched_in_thinking) and obj.get("thinking"):
+            parts.append(f"<thinking>\n{obj['thinking'].strip()}\n</thinking>")
+        if include_tools and tcalls:
+            res_indices = planner_result_steps.get(idx, [])
+            summaries = []
+            for j, tc in enumerate(tcalls):
+                sc = summarize_tool_call(tc)
+                if j < len(res_indices):
+                    r_idx = res_indices[j]
+                    spawned_cid = result_step_subagent.get(r_idx)
+                    if spawned_cid:
+                        summaries.append(f"[Step {r_idx} -> {spawned_cid}] {sc}")
+                    else:
+                        summaries.append(f"[Step {r_idx}] {sc}")
+                else:
+                    summaries.append(sc)
+            parts.append("Tools: " + "; ".join(summaries))
+        content = (obj.get("content") or "").strip()
+        if content:
+            parts.append(content)
+        if parts:
+            return f"\n[Step {idx} | AGENT | {created}]\n" + "\n".join(parts), next_ask
+        return None, next_ask
+
+    if stype == "GENERIC" and ask_question_pending:
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
+            return None, False
+        ans = (obj.get("content") or "").strip()
+        if ans:
+            return f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}", False
+        return None, False
+
+    if stype == "SYSTEM_MESSAGE" and include_system:
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
+            return None, ask_question_pending
+        sender, clean_sys = extract_system_message(obj.get("content") or "")
+        if not has_query and ("/task-" in sender or clean_sys.startswith("Task id ")):
+            return None, ask_question_pending
+        cap = 1200 if has_query else 400
+        preview = clean_sys[:cap] + ("..." if len(clean_sys) > cap else "")
+        return f"\n[Step {idx} | {stype} | {created}]\n{preview}", ask_question_pending
+
+    if stype == "CHECKPOINT" and include_system:
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
+            return None, ask_question_pending
+        raw = (obj.get("content") or "").strip()
+        cap = 1200 if has_query else 400
+        preview = raw[:cap] + ("..." if len(raw) > cap else "")
+        return f"\n[Step {idx} | {stype} | {created}]\n{preview}", ask_question_pending
+
+    return None, ask_question_pending
 
 
 def tool_get_conversation_digest(args: dict[str, Any]) -> str:
@@ -749,7 +963,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         f"({total_file_steps} steps, turns={total_turns}, tools={total_tools}{dur_part})"
     )
     app_dir = app_data_dir()
-    catalog = load_model_catalog(app_dir) if (not is_scoped or include_subagents) else None
+    catalog = _cached_model_catalog(app_dir) if (not is_scoped or include_subagents) else None
     meta_line = f"Conversation: {cid}\nStep range: {step_range_str}"
     subagents: list[str] = []
     subagent_total = 0
@@ -766,7 +980,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 parent_cid = row["parent_conversation_id"] or ""
                 parent_info = f" | parent={parent_cid}" if parent_cid else ""
                 self_ctx = (
-                    inspect_conversation_db(
+                    _cached_inspect_db(
                         cid,
                         app_dir,
                         catalog=catalog,
@@ -777,6 +991,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                             "nesting_depth": row["nesting_depth"],
                             "parent_conversation_id": parent_cid,
                         },
+                        include_spawned=False,
                     )
                     if not is_scoped
                     else None
@@ -804,7 +1019,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                     f"Workspace: {ws}"
                 )
             elif not is_scoped:
-                self_ctx = inspect_conversation_db(cid, app_dir, catalog=catalog)
+                self_ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, include_spawned=False)
                 ctx_line = (
                     f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
                     if self_ctx is not None
@@ -823,7 +1038,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                 for sr in sub_rows:
                     scid = sr["conversation_id"]
                     s_rinfo = subagent_role_map.get(scid.lower())
-                    s_ctx = inspect_conversation_db(
+                    s_ctx = _cached_inspect_db(
                         scid,
                         app_dir,
                         catalog=catalog,
@@ -836,6 +1051,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                             "role": (s_rinfo or {}).get("role", ""),
                             "type_name": (s_rinfo or {}).get("type", ""),
                         },
+                        include_spawned=False,
                     )
                     s_metrics = compute_transcript_metrics(scid)
                     rtag = format_subagent_role_tag(s_rinfo, s_ctx)
@@ -851,15 +1067,13 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
                         subagents.append(f"{scid}{role_part} (steps={sr['step_count']} | {ctx_tag})")
     except FileNotFoundError:
         if not is_scoped:
-            self_ctx = inspect_conversation_db(cid, app_dir, catalog=catalog)
+            self_ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, include_spawned=False)
             ctx_line = (
                 f"{self_ctx['model']} | {format_compact_context_tag(self_ctx)}"
                 if self_ctx is not None
                 else format_compact_context_tag(None)
             )
             meta_line = f"{meta_line}\nContext: {ctx_line}"
-
-    full_map = load_full_steps(full_path, need_full)
 
     header_parts = [meta_line]
     if not is_scoped:
@@ -876,79 +1090,71 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         header_parts.append("--- Digest ---")
     header_text = "\n".join(header_parts)
 
-    rendered_steps: list[tuple[int, str]] = []
-    ask_question_pending = False
-    for obj in steps:
-        idx = obj.get("step_index", 0)
-        stype = obj.get("type")
-        created = obj.get("created_at", "")
-        if idx in full_map:
-            obj = full_map[idx]
+    parsed_query = _parse_step_query(raw_query) if has_query else None
+    budget = max(1000, max_chars - len(header_text) - 220)
 
-        matched_query, matched_in_thinking = match_query_in_step(obj, raw_query) if has_query else (True, False)
+    def _render_window(window_steps: list[dict[str, Any]], full_map: dict[int, dict[str, Any]]) -> list[tuple[int, str]]:
+        out: list[tuple[int, str]] = []
+        ask_pending = False
+        for obj in window_steps:
+            idx = obj.get("step_index", 0)
+            if idx in full_map and full_map[idx].get("type") == obj.get("type"):
+                obj = full_map[idx]
+            block, ask_pending = _render_digest_step(
+                obj,
+                include_tools=include_tools,
+                include_thinking=include_thinking,
+                include_system=include_system,
+                has_query=has_query,
+                raw_query=raw_query,
+                parsed_query=parsed_query,
+                planner_result_steps=planner_result_steps,
+                result_step_subagent=result_step_subagent,
+                ask_question_pending=ask_pending,
+            )
+            if block is not None:
+                out.append((idx, block))
+        return out
 
-        if stype == "USER_INPUT":
-            ask_question_pending = False
-            if not matched_query:
+    tail_start = 0
+    if not has_explicit_start and len(steps) > 40:
+        est_used = 0
+        est_kept = 0
+        target_est = budget + 4000
+        for pos in range(len(steps) - 1, -1, -1):
+            obj = steps[pos]
+            stype = obj.get("type")
+            if stype == "GENERIC":
                 continue
-            text = extract_user_text(obj.get("content", ""))
-            rendered_steps.append((idx, f"\n[Step {idx} | USER | {created}]\n{text}"))
+            block, _ = _render_digest_step(
+                obj,
+                include_tools=include_tools,
+                include_thinking=include_thinking,
+                include_system=include_system,
+                has_query=False,
+                raw_query="",
+                parsed_query=None,
+                planner_result_steps=planner_result_steps,
+                result_step_subagent=result_step_subagent,
+                ask_question_pending=False,
+            )
+            if block is not None:
+                est_used += len(block) + 1
+                est_kept += 1
+                if est_kept >= 2 and est_used > target_est:
+                    tail_start = pos
+                    break
+        while tail_start > 0 and steps[tail_start].get("type") == "GENERIC":
+            tail_start -= 1
 
-        elif stype == "PLANNER_RESPONSE":
-            tcalls = obj.get("tool_calls") or []
-            has_ask = any(tc.get("name") == "ask_question" for tc in tcalls)
-            ask_question_pending = has_ask
-            if not matched_query:
-                continue
-            parts = []
-            if (include_thinking or matched_in_thinking) and obj.get("thinking"):
-                parts.append(f"<thinking>\n{obj['thinking'].strip()}\n</thinking>")
-            if include_tools and tcalls:
-                res_indices = planner_result_steps.get(idx, [])
-                summaries = []
-                for j, tc in enumerate(tcalls):
-                    sc = summarize_tool_call(tc)
-                    if j < len(res_indices):
-                        r_idx = res_indices[j]
-                        spawned_cid = result_step_subagent.get(r_idx)
-                        if spawned_cid:
-                            summaries.append(f"[Step {r_idx} -> {spawned_cid}] {sc}")
-                        else:
-                            summaries.append(f"[Step {r_idx}] {sc}")
-                    else:
-                        summaries.append(sc)
-                parts.append("Tools: " + "; ".join(summaries))
-            content = (obj.get("content") or "").strip()
-            if content:
-                parts.append(content)
-            if parts:
-                rendered_steps.append((idx, f"\n[Step {idx} | AGENT | {created}]\n" + "\n".join(parts)))
+    window_steps = steps[tail_start:] if tail_start > 0 else steps
+    window_need_full = need_full & {s.get("step_index", 0) for s in window_steps} if tail_start > 0 else need_full
+    full_map = load_full_steps(full_path, window_need_full)
+    rendered_steps = _render_window(window_steps, full_map)
 
-        elif stype == "GENERIC" and ask_question_pending:
-            ask_question_pending = False
-            if not matched_query:
-                continue
-            ans = (obj.get("content") or "").strip()
-            if ans:
-                rendered_steps.append((idx, f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}"))
-
-        elif stype == "SYSTEM_MESSAGE" and include_system:
-            if not matched_query:
-                continue
-            sender, clean_sys = extract_system_message(obj.get("content") or "")
-            if not has_query and ("/task-" in sender or clean_sys.startswith("Task id ")):
-                continue
-            cap = 1200 if has_query else 400
-            preview = clean_sys[:cap] + ("..." if len(clean_sys) > cap else "")
-            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]\n{preview}"))
-
-        elif stype == "CHECKPOINT" and include_system:
-            if not matched_query:
-                continue
-            raw = (obj.get("content") or "").strip()
-            cap = 1200 if has_query else 400
-            preview = raw[:cap] + ("..." if len(raw) > cap else "")
-            rendered_steps.append((idx, f"\n[Step {idx} | {stype} | {created}]\n{preview}"))
+    if tail_start > 0 and sum(len(b) + 1 for _, b in rendered_steps) <= budget:
+        full_map = load_full_steps(full_path, need_full)
+        rendered_steps = _render_window(steps, full_map)
 
     if has_query and not rendered_steps:
         return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_step or (max_file_idx or 0)}."
@@ -957,7 +1163,6 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     if len(header_text) + 1 + len(body_text) <= max_chars or not rendered_steps:
         return f"{header_text}\n{body_text}" if body_text else header_text
 
-    budget = max(1000, max_chars - len(header_text) - 220)
     if has_explicit_start:
         kept: list[tuple[int, str]] = []
         used = 0
@@ -1024,6 +1229,10 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
     found_map: dict[int, dict[str, Any]] = {}
     with chosen_path.open(encoding="utf-8") as f:
         for line in f:
+            m = STEP_INDEX_PREFIX_RE.match(line)
+            if m is not None:
+                if int(m.group(1)) not in target_set:
+                    continue
             line = line.strip()
             if not line:
                 continue
@@ -1091,7 +1300,7 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
     include_subagents = bool(raw_inc_sub) if raw_inc_sub is not None else (len(target_ids) == 1)
 
     app_dir = app_data_dir()
-    catalog = load_model_catalog(app_dir)
+    catalog = _cached_model_catalog(app_dir)
 
     summary_map: dict[str, sqlite3.Row] = {}
     sub_rows_by_parent: dict[str, list[sqlite3.Row]] = {}
@@ -1131,7 +1340,7 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
                 "nesting_depth": sr["nesting_depth"],
                 "parent_conversation_id": sr["parent_conversation_id"] or "",
             }
-        ctx = inspect_conversation_db(cid, app_dir, catalog=catalog, summary_meta=smeta)
+        ctx = _cached_inspect_db(cid, app_dir, catalog=catalog, summary_meta=smeta, include_spawned=include_subagents)
         if ctx is None:
             if len(target_ids) == 1:
                 raise FileNotFoundError(
@@ -1181,7 +1390,9 @@ def tool_get_conversation_context(args: dict[str, Any]) -> str:
                 sub_contexts = []
                 for scid in ordered_subs:
                     s_meta = sub_smeta_map[scid]
-                    s_ctx = inspect_conversation_db(scid, app_dir, catalog=catalog, summary_meta=s_meta)
+                    s_ctx = _cached_inspect_db(
+                        scid, app_dir, catalog=catalog, summary_meta=s_meta, include_spawned=False
+                    )
                     if s_ctx is None:
                         sub_contexts.append(
                             {"conversation_id": scid, "role": s_meta.get("role", ""), "_missing_db": True}
