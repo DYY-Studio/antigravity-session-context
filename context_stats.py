@@ -144,39 +144,66 @@ def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     raise ValueError("Truncated varint")
 
 
+_GEN_FIELDS = frozenset((1, 3))
+_CHAT_FIELDS = frozenset((4, 9, 19, 21))
+_PLANNER_FIELDS = frozenset((28,))
+_MD_USAGE_FIELDS = frozenset((9,))
+_MD_TC_FIELDS = frozenset((4,))
+
+
 class Msg:
     """Lazily decoded protobuf message: field number -> list of raw values."""
 
-    def __init__(self, buf: bytes | None):
+    def __init__(self, buf: bytes | None, wanted: frozenset[int] | None = None):
         self.fields: dict[int, list[Any]] = {}
+        self._msg_cache: dict[tuple[int, frozenset[int] | None], Msg | None] = {}
         raw = buf or b""
         pos, n = 0, len(raw)
         while pos < n:
             try:
-                tag, pos = read_varint(raw, pos)
+                b = raw[pos]
+                if b < 0x80:
+                    tag = b
+                    pos += 1
+                else:
+                    tag, pos = read_varint(raw, pos)
                 fn, wt = tag >> 3, tag & 7
+                keep = wanted is None or fn in wanted
                 if wt == 0:
-                    val: Any
-                    val, pos = read_varint(raw, pos)
+                    if pos < n and raw[pos] < 0x80:
+                        val: Any = raw[pos]
+                        pos += 1
+                    else:
+                        val, pos = read_varint(raw, pos)
                 elif wt == 2:
-                    ln, pos = read_varint(raw, pos)
+                    if pos < n and raw[pos] < 0x80:
+                        ln = raw[pos]
+                        pos += 1
+                    else:
+                        ln, pos = read_varint(raw, pos)
                     if ln < 0 or pos + ln > n:
                         break
-                    val = raw[pos : pos + ln]
+                    if keep:
+                        val = raw[pos : pos + ln]
                     pos += ln
                 elif wt == 1:
                     if pos + 8 > n:
                         break
-                    val, pos = raw[pos : pos + 8], pos + 8
+                    if keep:
+                        val = raw[pos : pos + 8]
+                    pos += 8
                 elif wt == 5:
                     if pos + 4 > n:
                         break
-                    val, pos = raw[pos : pos + 4], pos + 4
+                    if keep:
+                        val = raw[pos : pos + 4]
+                    pos += 4
                 else:
                     break
             except ValueError:
                 break
-            self.fields.setdefault(fn, []).append(val)
+            if keep:
+                self.fields.setdefault(fn, []).append(val)
 
     def has(self, fn: int) -> bool:
         return fn in self.fields
@@ -195,11 +222,16 @@ class Msg:
     def str(self, fn: int) -> str:
         return self.bytes(fn).decode("utf-8", errors="replace")
 
-    def msg(self, fn: int) -> "Msg | None":
-        return Msg(self.bytes(fn)) if self.has(fn) else None
+    def msg(self, fn: int, wanted: frozenset[int] | None = None) -> "Msg | None":
+        key = (fn, wanted)
+        if key in self._msg_cache:
+            return self._msg_cache[key]
+        res = Msg(self.bytes(fn), wanted) if self.has(fn) else None
+        self._msg_cache[key] = res
+        return res
 
-    def msgs(self, fn: int) -> list["Msg"]:
-        return [Msg(v) for v in self.fields.get(fn, []) if isinstance(v, bytes)]
+    def msgs(self, fn: int, wanted: frozenset[int] | None = None) -> list["Msg"]:
+        return [Msg(v, wanted) for v in self.fields.get(fn, []) if isinstance(v, bytes)]
 
 
 def fmt_tok(n: int) -> str:
@@ -377,7 +409,10 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
         return False, out
     for it in items:
         left, sep, right = it.str(1).partition(": ")
-        if not sep or not re.fullmatch(r"[+-]?[0-9]+", left) or right not in STEP_TYPES:
+        if not sep or right not in STEP_TYPES:
+            return False, [0, 0, 0, 0]
+        digits = left[1:] if left[:1] in "+-" else left
+        if not digits or not digits.isascii() or not digits.isdigit():
             return False, [0, 0, 0, 0]
         cat = step_category(STEP_TYPES[right])
         tok = it.int(3, signed32=True)
@@ -392,7 +427,16 @@ def chat_tokens_by_category(items: list[Msg]) -> tuple[bool, list[int]]:
     return True, out
 
 
-def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict[str, Any]:
+def _gen_chat(gen: Msg | None) -> Msg | None:
+    return gen.msg(1, _CHAT_FIELDS) if gen is not None else None
+
+
+def collect_stats(
+    steps: list[Step],
+    gen: Msg | None,
+    limit: int,
+    newer_override: tuple[int, Step | None] | None = None,
+) -> dict[str, Any]:
     st: dict[str, Any] = {
         k: 0
         for k in (
@@ -405,9 +449,12 @@ def collect_stats(steps: list[Step], gen: Msg | None, limit: int) -> dict[str, A
     st["active_checkpoint"] = -1
     checkpoints: list[dict[str, Any]] = []
 
-    chat = gen.msg(1) if gen is not None else None
+    chat = _gen_chat(gen)
     chat_start = chat.msg(9) if chat is not None else None
-    newer_pos, newer_step = checkpoint_newer_than_generation(steps, chat_start)
+    if newer_override is not None:
+        newer_pos, newer_step = newer_override
+    else:
+        newer_pos, newer_step = checkpoint_newer_than_generation(steps, chat_start)
     has_newer = newer_step is not None
     st["compacted"] = has_newer
 
@@ -553,7 +600,7 @@ def checkpoint_view(st: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def model_id(gen: Msg | None) -> str:
-    planner = gen.msg(3) if gen is not None else None
+    planner = gen.msg(3, _PLANNER_FIELDS) if gen is not None else None
     return planner.str(28) if planner is not None else ""
 
 
@@ -575,7 +622,7 @@ def model_label(slug: str) -> str:
 
 
 def model_name(gen: Msg | None, slug_fallback: str = "") -> str:
-    chat = gen.msg(1) if gen is not None else None
+    chat = _gen_chat(gen)
     if chat is not None and chat.str(21):
         return chat.str(21)
     slug = model_id(gen) or slug_fallback
@@ -587,7 +634,7 @@ def model_name(gen: Msg | None, slug_fallback: str = "") -> str:
 
 
 def request_budget(gen: Msg | None) -> int:
-    chat = gen.msg(1) if gen is not None else None
+    chat = _gen_chat(gen)
     start = chat.msg(9) if chat is not None else None
     cwm = start.msg(10) if start is not None else None
     return cwm.int(4, signed32=True) if cwm is not None else 0
@@ -677,23 +724,29 @@ def _resolve_run_state(
     is_subagent: bool,
     summary_status: str = "",
     killed: bool = False,
+    step_count: int | None = None,
+    has_reported_override: bool | None = None,
 ) -> tuple[str, str]:
     term_reason = TERM_REASON_NAMES.get(term_reason_code, "")
     if killed:
         return "killed", term_reason
 
-    has_reported = False
-    if is_subagent:
-        for s in steps:
-            if s.status != STATUS_DONE:
-                continue
-            tc = s.md.msg(4)
-            if tc is not None and tc.str(2) == "send_message":
-                has_reported = True
-                break
+    if has_reported_override is not None:
+        has_reported = has_reported_override
+    else:
+        has_reported = False
+        if is_subagent:
+            for s in steps:
+                if s.status != STATUS_DONE:
+                    continue
+                tc = s.md.msg(4)
+                if tc is not None and tc.str(2) == "send_message":
+                    has_reported = True
+                    break
 
+    total_steps = len(steps) if step_count is None else step_count
     last_step = steps[-1] if steps else None
-    executor_active = bool(steps and (term_step_idx < 0 or term_step_idx < len(steps) - 1))
+    executor_active = bool(total_steps and (term_step_idx < 0 or term_step_idx < total_steps - 1))
 
     if last_step is not None and last_step.status == STATUS_GENERATING:
         state = "generating"
@@ -711,7 +764,7 @@ def _resolve_run_state(
         state = "canceled"
     elif executor_active and summary_status != "CASCADE_RUN_STATUS_IDLE":
         state = "running"
-    elif not steps:
+    elif not total_steps:
         state = "starting"
     else:
         state = "idle"
@@ -724,11 +777,26 @@ def _resolve_run_state(
     return state, term_reason
 
 
+def _has_category_breakdown(gen: Msg | None) -> bool:
+    chat = _gen_chat(gen)
+    chat_start = chat.msg(9) if chat is not None else None
+    cwm = chat_start.msg(10) if chat_start is not None else None
+    breakdown = cwm.msg(3) if cwm is not None else None
+    if breakdown is None:
+        return False
+    for g in breakdown.msgs(1):
+        if g.int(2) == TOKEN_CHAT_MESSAGES and g.int(4, signed32=True):
+            ok, _ = chat_tokens_by_category(g.msgs(5))
+            return ok
+    return False
+
+
 def inspect_conversation_db(
     cid: str,
     app_dir: Path,
     catalog: dict[str, Any] | None = None,
     summary_meta: dict[str, Any] | None = None,
+    include_spawned: bool = True,
 ) -> dict[str, Any] | None:
     """Read conversations/<cid>.db read-only and return structured context metrics, or None if .db missing."""
     db_path = app_dir / "conversations" / f"{cid}.db"
@@ -741,10 +809,8 @@ def inspect_conversation_db(
     term_reason_code = 0
     term_step_idx = -1
     try:
-        rows = conn.execute("SELECT idx, step_type, status, metadata, step_payload FROM steps ORDER BY idx").fetchall()
-        steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(rows)]
         gen_row = conn.execute("SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 1").fetchone()
-        gen = Msg(gen_row[0]) if (gen_row and gen_row[0]) else None
+        gen = Msg(gen_row[0], _GEN_FIELDS) if (gen_row and gen_row[0]) else None
         try:
             trow = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
             if trow and trow[0]:
@@ -759,35 +825,170 @@ def inspect_conversation_db(
                 term_step_idx = em.int(3)
         except sqlite3.Error:
             pass
+
+        lineage = parse_trajectory_lineage(tmb)
+        cat_map = catalog if catalog is not None else load_model_catalog(app_dir)
+
+        slug = model_id(gen) or ENUM_MODEL_IDS.get(lineage["model_enum"], "")
+        cat_entry = cat_map.get(slug) if slug else None
+        cat_entry = cat_entry if isinstance(cat_entry, dict) else {}
+
+        cat_max = int(cat_entry.get("maxTokens") or 0)
+        raw_req_budget = request_budget(gen)
+        if cat_max > 0:
+            limit = cat_max
+            limit_source = "catalog"
+        else:
+            b_win = builtin_window_limit(slug)
+            if b_win > 0:
+                limit = b_win
+                limit_source = "builtin"
+            elif raw_req_budget > 0:
+                limit = raw_req_budget
+                limit_source = "request_budget"
+            else:
+                limit = 0
+                limit_source = "unknown"
+
+        model_disp = str(cat_entry.get("displayName") or "").strip() or model_name(gen, slug)
+        smeta = summary_meta or {}
+        is_subagent = bool(lineage["parent_conversation_id"] or smeta.get("parent_conversation_id"))
+
+        step_count = conn.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
+        last_row = (
+            conn.execute(
+                "SELECT idx, step_type, status, metadata, step_payload FROM steps ORDER BY idx DESC LIMIT 1"
+            ).fetchone()
+            if step_count > 0
+            else None
+        )
+
+        use_fast = (step_count == 0) or (
+            _has_category_breakdown(gen) and last_row is not None and last_row[3] is not None
+        )
+        st: dict[str, Any] | None = None
+        budget_used = 0
+        state_steps: list[Step] = []
+        has_reported_override: bool | None = None
+        spawned: dict[str, dict[str, str]] = {}
+
+        if use_fast:
+            if step_count == 0:
+                st = collect_stats([], gen, limit)
+                budget_used = int(st["total"])
+                has_reported_override = False
+            else:
+                ckpt_rows = conn.execute(
+                    "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                    "WHERE step_type = 23 ORDER BY idx"
+                ).fetchall()
+                ckpt_steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(ckpt_rows)]
+                last_done_ckpt_sql_idx = -1
+                last_done_ckpt_pos = -1
+                last_done_ckpt_step: Step | None = None
+                for pos, (r, s) in enumerate(zip(ckpt_rows, ckpt_steps)):
+                    if s.payload(STEP_CHECKPOINT) is not None and s.status == STATUS_DONE:
+                        last_done_ckpt_sql_idx = r[0]
+                        last_done_ckpt_pos = pos
+                        last_done_ckpt_step = s
+
+                has_newer = False
+                if last_done_ckpt_step is not None:
+                    has_planner_after = (
+                        conn.execute(
+                            "SELECT 1 FROM steps WHERE idx > ? AND step_type = 15 AND status = ? LIMIT 1",
+                            (last_done_ckpt_sql_idx, STATUS_DONE),
+                        ).fetchone()
+                        is not None
+                    )
+                    if not has_planner_after:
+                        chat = _gen_chat(gen)
+                        chat_start = chat.msg(9) if chat is not None else None
+                        gen_ck = chat_start.int(2, signed32=True) if chat_start is not None else -1
+                        ck_pb = last_done_ckpt_step.payload(STEP_CHECKPOINT)
+                        ck_idx = ck_pb.int(1) if ck_pb is not None else 0
+                        has_newer = gen_ck < ck_idx
+
+                if has_newer:
+                    post_rows = conn.execute(
+                        "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                        "WHERE idx > ? AND step_type != 23 ORDER BY idx",
+                        (last_done_ckpt_sql_idx,),
+                    ).fetchall()
+                    post_steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(post_rows)]
+                    st = collect_stats(
+                        ckpt_steps + post_steps,
+                        gen,
+                        limit,
+                        newer_override=(last_done_ckpt_pos, last_done_ckpt_step),
+                    )
+                    budget_used = int(st["total"])
+                else:
+                    st = collect_stats(ckpt_steps, gen, limit, newer_override=(-1, None))
+                    pos_planner_sql_idx = -1
+                    prefix_tok = 0
+                    for r_idx, r_meta in conn.execute(
+                        "SELECT idx, metadata FROM steps WHERE step_type = 15 AND idx > ? ORDER BY idx DESC",
+                        (last_done_ckpt_sql_idx,),
+                    ):
+                        if not r_meta:
+                            continue
+                        u = Msg(r_meta, _MD_USAGE_FIELDS).msg(9)
+                        if u is None:
+                            continue
+                        inp, out_tok, cache_r, cache_w = u.int(2), u.int(3), u.int(5), u.int(6)
+                        if inp + cache_r + cache_w > 0:
+                            pos_planner_sql_idx = r_idx
+                            prefix_tok = inp + cache_r + cache_w + out_tok
+                            break
+                    if pos_planner_sql_idx >= 0:
+                        tail_rows = conn.execute(
+                            "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                            "WHERE idx > ? AND step_type != 23 ORDER BY idx",
+                            (pos_planner_sql_idx,),
+                        ).fetchall()
+                        tail_steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(tail_rows)]
+                        delta_tok = sum(
+                            post_turn_step_tokens(s) for s in tail_steps if s.payload(STEP_CHECKPOINT) is None
+                        )
+                        budget_used = max(int(st["total"]), prefix_tok + delta_tok)
+                    else:
+                        budget_used = int(st["total"])
+
+                state_steps = [
+                    Step(step_count - 1, last_row[4] or b"", last_row[1], last_row[2], last_row[3])
+                ]
+                has_reported_override = False
+                if is_subagent:
+                    for (r_meta,) in conn.execute(
+                        "SELECT metadata FROM steps WHERE status = ? AND instr(metadata, ?) > 0",
+                        (STATUS_DONE, b"send_message"),
+                    ):
+                        tc = Msg(r_meta, _MD_TC_FIELDS).msg(4)
+                        if tc is not None and tc.str(2) == "send_message":
+                            has_reported_override = True
+                            break
+                if include_spawned:
+                    inv_rows = conn.execute(
+                        "SELECT idx, step_type, status, metadata, step_payload FROM steps "
+                        "WHERE step_type = 127 OR instr(metadata, ?) > 0 ORDER BY idx",
+                        (b"invoke_subagent",),
+                    ).fetchall()
+                    inv_steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(inv_rows)]
+                    spawned = extract_spawned_subagents(inv_steps)
+        else:
+            rows = conn.execute(
+                "SELECT idx, step_type, status, metadata, step_payload FROM steps ORDER BY idx"
+            ).fetchall()
+            steps = [Step(pos, r[4] or b"", r[1], r[2], r[3]) for pos, r in enumerate(rows)]
+            step_count = len(steps)
+            st = collect_stats(steps, gen, limit)
+            budget_used = effective_budget_tokens(steps, st)
+            state_steps = steps
+            has_reported_override = None
+            spawned = extract_spawned_subagents(steps) if include_spawned else {}
     finally:
         conn.close()
-
-    lineage = parse_trajectory_lineage(tmb)
-    cat_map = catalog if catalog is not None else load_model_catalog(app_dir)
-
-    slug = model_id(gen) or ENUM_MODEL_IDS.get(lineage["model_enum"], "")
-    cat_entry = cat_map.get(slug) if slug else None
-    cat_entry = cat_entry if isinstance(cat_entry, dict) else {}
-
-    cat_max = int(cat_entry.get("maxTokens") or 0)
-    raw_req_budget = request_budget(gen)
-    if cat_max > 0:
-        limit = cat_max
-        limit_source = "catalog"
-    else:
-        b_win = builtin_window_limit(slug)
-        if b_win > 0:
-            limit = b_win
-            limit_source = "builtin"
-        elif raw_req_budget > 0:
-            limit = raw_req_budget
-            limit_source = "request_budget"
-        else:
-            limit = 0
-            limit_source = "unknown"
-
-    model_disp = str(cat_entry.get("displayName") or "").strip() or model_name(gen, slug)
-    st = collect_stats(steps, gen, limit)
 
     if raw_req_budget > 0:
         req_budget = raw_req_budget
@@ -800,19 +1001,18 @@ def inspect_conversation_db(
         req_budget = limit
         budget_estimated = bool(limit > 0)
 
-    budget_used = effective_budget_tokens(steps, st)
     budget_pct = round(pct(budget_used, req_budget), 1) if req_budget else 0.0
     used_pct = round(min(100.0, pct(st["total"], limit)), 1) if limit else 0.0
 
-    smeta = summary_meta or {}
-    is_subagent = bool(lineage["parent_conversation_id"] or smeta.get("parent_conversation_id"))
     state, term_reason = _resolve_run_state(
-        steps,
+        state_steps,
         term_reason_code,
         term_step_idx,
         is_subagent=is_subagent,
         summary_status=str(smeta.get("status") or ""),
         killed=bool(smeta.get("killed")),
+        step_count=step_count,
+        has_reported_override=has_reported_override,
     )
 
     sys_total = sum(
@@ -832,7 +1032,7 @@ def inspect_conversation_db(
         "model": model_disp,
         "state": state,
         "termination_reason": term_reason,
-        "step_count": len(steps),
+        "step_count": step_count,
         "heading": stats_heading(st),
         "used_tokens": st["total"],
         "limit_tokens": limit,
@@ -859,7 +1059,7 @@ def inspect_conversation_db(
             "tool": st["tool"],
             "system": sys_total,
         },
-        "spawned_subagents": extract_spawned_subagents(steps),
+        "spawned_subagents": spawned,
     }
 
 
