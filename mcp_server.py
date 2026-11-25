@@ -30,6 +30,18 @@ SUBAGENT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([0-9a-fA-F-]{36})"')
 STEP_INDEX_PREFIX_RE = re.compile(r'^\s*\{\s*"step_index"\s*:\s*(\d+)')
 TYPE_FIELD_RE = re.compile(r'"type"\s*:\s*"([A-Z_]+)"')
 CREATED_AT_RE = re.compile(r'"created_at"\s*:\s*"([^"]*)"')
+CMD_EXIT_RE = re.compile(r"(?:^|\n)Command exited with code (-?\d+)\.")
+_CONTENT_READ_TOOLS = frozenset(
+    {
+        "read_file",
+        "grep_search",
+        "find_by_name",
+        "list_dir",
+        "view_file",
+        "view_file_outline",
+        "view_code_item",
+    }
+)
 
 _CACHE_LIMIT = 512
 _DB_CTX_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
@@ -291,6 +303,15 @@ def summarize_tool_call(tc: dict[str, Any]) -> str:
         if k in args and args[k] is not None:
             is_path = k == "Path"
             highlights.append(f"{k}={_clean_scalar(args[k], 85 if is_path else 80, keep_tail=is_path)}")
+    if name == "read_file":
+        sl = _clean_scalar(args["StartLine"], 16) if args.get("StartLine") is not None else ""
+        el = _clean_scalar(args["EndLine"], 16) if args.get("EndLine") is not None else ""
+        bo = _clean_scalar(args["ByteOffset"], 16) if args.get("ByteOffset") is not None else ""
+        if sl or el:
+            s_str = sl or "1"
+            highlights.append(f"Lines={s_str}-{el}" if el else f"Lines={s_str}+")
+        if bo and bo != "0":
+            highlights.append(f"ByteOffset={bo}")
     if not highlights and args:
         first_k = next(iter(args))
         is_path = first_k == "Path"
@@ -577,13 +598,98 @@ def tool_list_conversations(args: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _strip_tool_timestamps(raw: str) -> str:
+    text = raw or ""
+    while text.startswith(("Created At:", "Completed At:")):
+        nl = text.find("\n")
+        if nl == -1:
+            return ""
+        text = text[nl + 1 :]
+    return text.lstrip("\n")
+
+
+def _detect_tool_failure_tag(tool_name: str, generic_content: str) -> str:
+    body = _strip_tool_timestamps(generic_content)
+    if not body:
+        return ""
+    if tool_name == "run_command":
+        cmd_header = body.split("\nCommand output:", 1)[0][:600]
+        m = CMD_EXIT_RE.search(cmd_header)
+        if m and int(m.group(1)) != 0:
+            return f"exit={m.group(1)}"
+        if body.startswith("Error:"):
+            return "err"
+        return ""
+    if tool_name and tool_name not in _CONTENT_READ_TOOLS:
+        first_line = body.split("\n", 1)[0].strip()
+        if first_line.startswith("Error:"):
+            return "err"
+    return ""
+
+
+def _can_raw_filter_terms(terms: list[str]) -> bool:
+    return bool(terms) and all(all(ord(c) >= 0x20 and c not in ("\\", '"') for c in t) for t in terms)
+
+
+def _match_terms(haystack: str, is_or: bool, terms: list[str]) -> bool:
+    if not terms:
+        return True
+    return any(t in haystack for t in terms) if is_or else all(t in haystack for t in terms)
+
+
+def _extract_match_snippet(text: str, terms: list[str], max_len: int = 600) -> tuple[str, bool]:
+    """Extract compact window(s) around matching query terms. Returns (snippet, was_truncated)."""
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_len:
+        return cleaned, False
+    low = cleaned.lower()
+    hits: list[tuple[int, int]] = []
+    for t in terms:
+        if not t:
+            continue
+        p = low.find(t)
+        if p != -1:
+            hits.append((p, len(t)))
+    if not hits:
+        return cleaned[: max_len - 3].rstrip() + "...", True
+    hits.sort()
+    first, _ = hits[0]
+
+    def _window(pos: int, width: int, *, add_prefix: bool = True, add_suffix: bool = True) -> tuple[str, int, int]:
+        s = max(0, pos - min(180, width // 3))
+        e = min(len(cleaned), s + width)
+        if e - s < width:
+            s = max(0, e - width)
+        frag = cleaned[s:e].strip()
+        pref = "..." if (add_prefix and s > 0) else ""
+        suff = "..." if (add_suffix and e < len(cleaned)) else ""
+        return f"{pref}{frag}{suff}", s, e
+
+    single_snip, _, single_end = _window(first, max_len)
+    second = next((p for p, tlen in hits[1:] if p + tlen > single_end), None)
+    if second is None:
+        return single_snip, True
+
+    half = max(120, (max_len - 12) // 2)
+    w1, _, _ = _window(first, half, add_prefix=True, add_suffix=False)
+    w2, _, _ = _window(second, half, add_prefix=False, add_suffix=True)
+    return f"{w1}\n...\n{w2}", True
+
+
 def build_fts_query(raw_query: str) -> str:
-    tokens = [t for t in re.split(r"[\s|]+", raw_query.strip()) if t]
-    if not tokens:
+    if "\x00" in raw_query:
+        raise ValueError("Search query must not contain NUL bytes.")
+    q = raw_query.strip()
+    if not q:
         raise ValueError("Search query must not be empty.")
-    escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
-    if "|" in raw_query:
+    if "|" in q:
+        branches = [b.strip() for b in q.split("|") if b.strip()]
+        if not branches:
+            raise ValueError("Search query must not be empty.")
+        escaped = ['"' + b.replace('"', '""') + '"' for b in branches]
         return " OR ".join(escaped)
+    tokens = q.split()
+    escaped = ['"' + t.replace('"', '""') + '"' for t in tokens]
     return " ".join(escaped)
 
 
@@ -600,30 +706,35 @@ def match_query_in_step(
     obj: dict[str, Any],
     raw_query: str,
     parsed: tuple[bool, list[str]] | None = None,
+    *,
+    search_thinking: bool = True,
 ) -> tuple[bool, bool]:
-    """Return (matched, matched_in_thinking) for a step object against raw_query."""
+    """Return (matched, thinking_only_match) for a step object against raw_query."""
     is_or, terms = parsed if parsed is not None else _parse_step_query(raw_query)
     if not terms:
         return True, False
     content_hay = (obj.get("content") or "").lower()
-    thinking_hay = (obj.get("thinking") or "").lower()
     tcalls = obj.get("tool_calls")
     tools_hay = json.dumps(tcalls, ensure_ascii=False).lower() if tcalls else ""
-    combined = f"{content_hay} {thinking_hay} {tools_hay}"
-
-    if is_or:
-        matched = any(b in combined for b in terms)
-        in_thinking = any(b in thinking_hay for b in terms)
-        return matched, in_thinking
-
-    matched = all(t in combined for t in terms)
-    in_thinking = any(t in thinking_hay for t in terms)
-    return matched, in_thinking
+    visible_hay = f"{content_hay} {tools_hay}"
+    if _match_terms(visible_hay, is_or, terms):
+        return True, False
+    if not search_thinking:
+        return False, False
+    thinking_hay = (obj.get("thinking") or "").lower()
+    if not thinking_hay:
+        return False, False
+    combined = f"{visible_hay} {thinking_hay}"
+    matched = _match_terms(combined, is_or, terms)
+    return matched, matched
 
 
 def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
     raw_q = (raw_query or "").strip()
     if not raw_q:
+        return ""
+    is_or, terms = _parse_step_query(raw_q)
+    if not terms:
         return ""
     logs_dir = app_data_dir() / "brain" / cid / ".system_generated" / "logs"
     full_path = logs_dir / "transcript_full.jsonl"
@@ -632,11 +743,9 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
     if not chosen_path.is_file():
         return ""
 
-    tokens = [t.lower() for t in re.split(r"[\s|]+", raw_q) if t]
-    is_or = "|" in raw_q
-    can_raw_filter = all(all(ord(c) >= 0x20 and c not in ("\\", '"') for c in t) for t in tokens)
-    all_matches: list[int] = []
-    any_matches: list[int] = []
+    can_raw_filter = _can_raw_filter_terms(terms)
+    has_space_term = any(" " in t for t in terms)
+    matched: list[int] = []
     try:
         with chosen_path.open(encoding="utf-8") as f:
             for line in f:
@@ -647,9 +756,14 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
                     tm = TYPE_FIELD_RE.search(head)
                     if tm is not None and tm.group(1) not in ("USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
                         continue
-                if can_raw_filter and "\\u" not in line and "\\/" not in line:
+                if (
+                    can_raw_filter
+                    and "\\u" not in line
+                    and "\\/" not in line
+                    and not (has_space_term and '"tool_calls"' in line)
+                ):
                     low_raw = line.lower()
-                    if not any(t in low_raw for t in tokens):
+                    if not _match_terms(low_raw, is_or, terms):
                         continue
                 obj = json.loads(line)
                 stype = obj.get("type")
@@ -658,21 +772,15 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
                 idx = obj.get("step_index")
                 if idx is None:
                     continue
-                tcalls = obj.get("tool_calls")
-                tools_str = json.dumps(tcalls, ensure_ascii=False) if tcalls else ""
-                hay = ((obj.get("content") or "") + " " + (obj.get("thinking") or "") + " " + tools_str).lower()
-                if not is_or and all(t in hay for t in tokens):
-                    all_matches.append(idx)
-                elif any(t in hay for t in tokens):
-                    any_matches.append(idx)
+                if match_query_in_step(obj, raw_q, (is_or, terms))[0]:
+                    matched.append(idx)
     except Exception:
         return ""
-    chosen = all_matches if (all_matches and not is_or) else any_matches
-    if not chosen:
+    if not matched:
         return ""
-    shown = ", ".join(str(i) for i in chosen[:max_shown])
-    if len(chosen) > max_shown:
-        return f"[{shown}, ... ({len(chosen)} steps)]"
+    shown = ", ".join(str(i) for i in matched[:max_shown])
+    if len(matched) > max_shown:
+        return f"[{shown}, ... ({len(matched)} steps)]"
     return f"[{shown}]"
 
 
@@ -811,41 +919,120 @@ def load_full_steps(full_path: Path, step_indices: set[int]) -> dict[int, dict[s
     return {idx: items[-1] for idx, items in _load_full_steps_all(full_path, step_indices).items()}
 
 
+def _find_matching_generic_steps(
+    full_path: Path,
+    transcript_path: Path,
+    start_step: int,
+    end_step: int | None,
+    parsed_query: tuple[bool, list[str]],
+) -> dict[int, list[dict[str, Any]]]:
+    is_or, terms = parsed_query
+    if not terms:
+        return {}
+    chosen_path = full_path if full_path.is_file() else transcript_path
+    if not chosen_path.is_file():
+        return {}
+    can_raw_filter = _can_raw_filter_terms(terms)
+    found: dict[int, list[dict[str, Any]]] = {}
+    with chosen_path.open(encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            head = line[:260]
+            m = STEP_INDEX_PREFIX_RE.match(head)
+            if m is not None:
+                p_idx = int(m.group(1))
+                if p_idx < start_step or (end_step is not None and p_idx > end_step):
+                    continue
+                tm = TYPE_FIELD_RE.search(head)
+                if tm is not None and tm.group(1) != "GENERIC":
+                    continue
+            if can_raw_filter and "\\u" not in line and "\\/" not in line:
+                if not _match_terms(line.lower(), is_or, terms):
+                    continue
+            obj = json.loads(line)
+            if obj.get("type") != "GENERIC":
+                continue
+            idx = obj.get("step_index")
+            if idx is None or idx < start_step or (end_step is not None and idx > end_step):
+                continue
+            body = _strip_tool_timestamps(obj.get("content") or "")
+            if _match_terms(body.lower(), is_or, terms):
+                found.setdefault(idx, []).append(obj)
+    return found
+
+
+def _match_generic_step(
+    obj: dict[str, Any], matched_generics: dict[int, list[dict[str, Any]]] | None
+) -> dict[str, Any] | None:
+    if not matched_generics:
+        return None
+    idx = obj.get("step_index")
+    cands = matched_generics.get(idx) if idx is not None else None
+    if not cands:
+        return None
+    created = obj.get("created_at")
+    for c in reversed(cands):
+        if c.get("created_at") == created:
+            return c
+    if len(cands) == 1 and (not created or not cands[0].get("created_at")):
+        return cands[0]
+    return None
+
+
 def _render_digest_step(
     obj: dict[str, Any],
     *,
     include_tools: bool,
-    include_thinking: bool,
+    thinking_mode: str,
     include_system: bool,
     has_query: bool,
     raw_query: str,
     parsed_query: tuple[bool, list[str]] | None,
     planner_result_steps: dict[int, list[int]],
     result_step_subagent: dict[int, str],
-    ask_question_pending: bool,
-) -> tuple[str | None, bool]:
-    """Render one digest step and return (rendered_block_or_None, next_ask_question_pending)."""
+    result_step_error: dict[int, str],
+    ask_question_result_steps: set[tuple[int, str]],
+    matched_generics: dict[int, list[dict[str, Any]]] | None,
+    generic_to_call: dict[int, tuple[int, int, str, bool]] | None,
+) -> str | None:
+    """Render one digest step and return rendered block or None."""
     idx = obj.get("step_index", 0)
     stype = obj.get("type")
     created = obj.get("created_at", "")
+    search_thinking = thinking_mode != "never"
 
     if stype == "USER_INPUT":
-        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
-            return None, False
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query, search_thinking=False)[0]:
+            return None
         text = extract_user_text(obj.get("content", ""))
-        return f"\n[Step {idx} | USER | {created}]\n{text}", False
+        return f"\n[Step {idx} | USER | {created}]\n{text}"
 
     if stype == "PLANNER_RESPONSE":
         tcalls = obj.get("tool_calls") or []
-        next_ask = any(tc.get("name") == "ask_question" for tc in tcalls)
-        matched_query, matched_in_thinking = (
-            match_query_in_step(obj, raw_query, parsed_query) if has_query else (True, False)
+        matched_query, thinking_only = (
+            match_query_in_step(obj, raw_query, parsed_query, search_thinking=search_thinking)
+            if has_query
+            else (True, False)
         )
         if not matched_query:
-            return None, next_ask
+            return None
         parts = []
-        if (include_thinking or matched_in_thinking) and obj.get("thinking"):
-            parts.append(f"<thinking>\n{obj['thinking'].strip()}\n</thinking>")
+        thinking_raw = (obj.get("thinking") or "").strip()
+        if thinking_raw:
+            if thinking_mode == "always":
+                parts.append(f"<thinking>\n{thinking_raw}\n</thinking>")
+            elif thinking_mode == "auto" and thinking_only:
+                terms = parsed_query[1] if parsed_query else []
+                visible_hay = (
+                    (obj.get("content") or "").lower()
+                    + " "
+                    + (json.dumps(tcalls, ensure_ascii=False).lower() if tcalls else "")
+                )
+                focus_terms = [t for t in terms if t not in visible_hay] or terms
+                snip, was_trunc = _extract_match_snippet(thinking_raw, focus_terms, max_len=600)
+                note = " [snippet]" if was_trunc else ""
+                parts.append(f"<thinking{note}>\n{snip}\n</thinking>")
         if include_tools and tcalls:
             res_indices = planner_result_steps.get(idx, [])
             summaries = []
@@ -854,10 +1041,14 @@ def _render_digest_step(
                 if j < len(res_indices):
                     r_idx = res_indices[j]
                     spawned_cid = result_step_subagent.get(r_idx)
+                    err_tag = result_step_error.get(r_idx)
                     if spawned_cid:
-                        summaries.append(f"[Step {r_idx} -> {spawned_cid}] {sc}")
+                        label = f"Step {r_idx}, {err_tag} -> {spawned_cid}" if err_tag else f"Step {r_idx} -> {spawned_cid}"
+                    elif err_tag:
+                        label = f"Step {r_idx}, {err_tag}"
                     else:
-                        summaries.append(f"[Step {r_idx}] {sc}")
+                        label = f"Step {r_idx}"
+                    summaries.append(f"[{label}] {sc}")
                 else:
                     summaries.append(sc)
             parts.append("Tools: " + "; ".join(summaries))
@@ -865,46 +1056,72 @@ def _render_digest_step(
         if content:
             parts.append(content)
         if parts:
-            return f"\n[Step {idx} | AGENT | {created}]\n" + "\n".join(parts), next_ask
-        return None, next_ask
+            return f"\n[Step {idx} | AGENT | {created}]\n" + "\n".join(parts)
+        return None
 
-    if stype == "GENERIC" and ask_question_pending:
-        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
-            return None, False
+    if stype == "GENERIC" and (idx, created) in ask_question_result_steps:
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query, search_thinking=False)[0]:
+            return None
         ans = (obj.get("content") or "").strip()
         if ans:
-            return f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}", False
-        return None, False
+            return f"\n[Step {idx} | USER_ANSWER | {created}]\n{ans}"
+        return None
+
+    if stype == "GENERIC" and matched_generics:
+        matched_obj = _match_generic_step(obj, matched_generics)
+        if matched_obj is None:
+            return None
+        body = _strip_tool_timestamps(matched_obj.get("content") or "")
+        terms = parsed_query[1] if parsed_query else []
+        snip, was_trunc = _extract_match_snippet(body, terms, max_len=600)
+        call_info = generic_to_call.get(idx) if generic_to_call else None
+        err_tag = result_step_error.get(idx)
+        err_part = f", {err_tag}" if err_tag else ""
+        if call_info:
+            p_idx, _, call_summary, _ = call_info
+            header = f"\n[Step {idx} | TOOL_OUTPUT{err_part} (from Step {p_idx}: {call_summary}) | {created}]"
+        else:
+            header = f"\n[Step {idx} | TOOL_OUTPUT{err_part} | {created}]"
+        tail = f"\n(total {len(body)} chars; use get_conversation_step(step_index={idx}) for full output)" if was_trunc else ""
+        return f"{header}\n{snip}{tail}"
 
     if stype == "SYSTEM_MESSAGE" and include_system:
-        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
-            return None, ask_question_pending
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query, search_thinking=False)[0]:
+            return None
         sender, clean_sys = extract_system_message(obj.get("content") or "")
         if not has_query and ("/task-" in sender or clean_sys.startswith("Task id ")):
-            return None, ask_question_pending
+            return None
         cap = 1200 if has_query else 400
         preview = clean_sys[:cap] + ("..." if len(clean_sys) > cap else "")
-        return f"\n[Step {idx} | {stype} | {created}]\n{preview}", ask_question_pending
+        return f"\n[Step {idx} | {stype} | {created}]\n{preview}"
 
     if stype == "CHECKPOINT" and include_system:
-        if has_query and not match_query_in_step(obj, raw_query, parsed_query)[0]:
-            return None, ask_question_pending
+        if has_query and not match_query_in_step(obj, raw_query, parsed_query, search_thinking=False)[0]:
+            return None
         raw = (obj.get("content") or "").strip()
         cap = 1200 if has_query else 400
         preview = raw[:cap] + ("..." if len(raw) > cap else "")
-        return f"\n[Step {idx} | {stype} | {created}]\n{preview}", ask_question_pending
+        return f"\n[Step {idx} | {stype} | {created}]\n{preview}"
 
-    return None, ask_question_pending
+    return None
 
 
 def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     cid = validate_conversation_id(str(get_arg(args, "conversation_id", "conversationId", default="")))
     include_tools = bool(get_arg(args, "include_tools", "includeTools", default=True))
-    include_thinking = bool(get_arg(args, "include_thinking", "includeThinking", default=False))
+    raw_inc_thinking = get_arg(args, "include_thinking", "includeThinking")
+    if raw_inc_thinking is None:
+        thinking_mode = "auto"
+    else:
+        thinking_mode = "always" if bool(raw_inc_thinking) else "never"
     include_system = bool(get_arg(args, "include_system_messages", "includeSystemMessages", default=True))
+    include_tool_outputs = bool(get_arg(args, "include_tool_outputs", "includeToolOutputs", default=False))
     raw_inc_subagents = get_arg(args, "include_subagents", "includeSubagents")
     raw_query = str(get_arg(args, "query", default="") or "").strip()
-    has_query = bool(raw_query)
+    parsed_query = _parse_step_query(raw_query) if raw_query else None
+    if raw_query and (parsed_query is None or not parsed_query[1]):
+        raise ValueError("Query must contain at least one search term.")
+    has_query = bool(parsed_query and parsed_query[1])
     raw_start = get_arg(args, "start_step", "startStep")
     raw_end = get_arg(args, "end_step", "endStep")
     is_scoped = raw_start is not None or raw_end is not None or has_query
@@ -925,10 +1142,15 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     steps: list[dict[str, Any]] = []
     need_full: set[int] = set()
     planner_result_steps: dict[int, list[int]] = {}
+    planner_created: dict[int, str] = {}
     result_step_subagent: dict[int, str] = {}
+    result_step_error: dict[int, str] = {}
+    ask_question_result_steps: set[tuple[int, str]] = set()
+    generic_to_call: dict[int, tuple[int, int, str, bool]] = {}
     subagent_role_map: dict[str, dict[str, Any]] = {}
     last_planner_idx: int | None = None
     last_planner_tcalls: list[dict[str, Any]] = []
+    last_planner_tcalls_trunc = False
     min_file_idx: int | None = None
     max_file_idx: int | None = None
     total_file_steps = 0
@@ -936,6 +1158,8 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     total_tools = 0
     first_ts = ""
     last_ts = ""
+    want_generic_search = include_tool_outputs and has_query
+    need_full_thinking = thinking_mode == "always" or (thinking_mode == "auto" and has_query)
 
     with transcript_path.open(encoding="utf-8") as f:
         for line in f:
@@ -946,6 +1170,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             idx = obj.get("step_index", 0)
             t = obj.get("type")
             created = obj.get("created_at") or ""
+            trunc = obj.get("truncated_fields") or []
             if created:
                 if not first_ts:
                     first_ts = created
@@ -956,40 +1181,67 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             if max_file_idx is None or idx > max_file_idx:
                 max_file_idx = idx
 
+            is_ask_answer = False
             if t == "PLANNER_RESPONSE":
                 total_turns += 1
                 tcalls = obj.get("tool_calls") or []
                 total_tools += len(tcalls)
                 last_planner_idx = idx
                 last_planner_tcalls = tcalls
+                last_planner_tcalls_trunc = "tool_calls" in trunc
                 planner_result_steps[idx] = []
+                planner_created[idx] = created
             elif t == "GENERIC" and last_planner_idx is not None:
-                j = len(planner_result_steps[last_planner_idx])
-                planner_result_steps[last_planner_idx].append(idx)
+                res_list = planner_result_steps[last_planner_idx]
+                if idx in res_list:
+                    j = res_list.index(idx)
+                else:
+                    j = len(res_list)
+                    res_list.append(idx)
                 if j < len(last_planner_tcalls):
-                    parsed = _parse_subagent_invocation(
-                        last_planner_tcalls[j], obj.get("content") or "", last_planner_idx
-                    )
+                    tc = last_planner_tcalls[j]
+                    tname = tc.get("name", "")
+                    g_content = obj.get("content") or ""
+                    if tname == "ask_question":
+                        ask_question_result_steps.add((idx, created))
+                        is_ask_answer = True
+                    parsed = _parse_subagent_invocation(tc, g_content, last_planner_idx)
                     if parsed:
                         result_step_subagent[idx] = parsed[0]
                         subagent_role_map[parsed[0]] = parsed[1]
+                    else:
+                        result_step_subagent.pop(idx, None)
+                    ftag = _detect_tool_failure_tag(tname, g_content)
+                    if ftag:
+                        result_step_error[idx] = ftag
+                    else:
+                        result_step_error.pop(idx, None)
+                    if want_generic_search:
+                        generic_to_call[idx] = (
+                            last_planner_idx,
+                            j,
+                            summarize_tool_call(tc),
+                            last_planner_tcalls_trunc,
+                        )
             else:
                 last_planner_idx = None
                 last_planner_tcalls = []
+                last_planner_tcalls_trunc = False
 
             if idx < start_step:
                 continue
             if end_step is not None and idx > end_step:
                 continue
             steps.append(obj)
-            trunc = obj.get("truncated_fields") or []
             if trunc:
                 if t in ("USER_INPUT", "SYSTEM_MESSAGE") and "content" in trunc:
+                    need_full.add(idx)
+                elif is_ask_answer and "content" in trunc:
                     need_full.add(idx)
                 elif t == "PLANNER_RESPONSE":
                     if (
                         "content" in trunc
-                        or ((include_thinking or has_query) and "thinking" in trunc)
+                        or (need_full_thinking and "thinking" in trunc)
                         or ((include_tools or has_query) and "tool_calls" in trunc)
                     ):
                         need_full.add(idx)
@@ -1133,36 +1385,69 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         header_parts.append("Subagents:\n" + "\n".join(f"  - {s}" for s in subagents))
     elif subagent_total > 0:
         header_parts.append(f"Subagents: {subagent_total} (pass include_subagents=true or use list_conversations to expand)")
+    if include_tool_outputs and not has_query:
+        header_parts.append(
+            "Note: include_tool_outputs=true requires query to filter tool outputs (skipped raw tool outputs without query)."
+        )
     if has_query:
-        header_parts.append(f"--- Digest (filtered by query={raw_query!r}) ---")
+        scope_note = " + tool outputs" if want_generic_search else ""
+        header_parts.append(f"--- Digest (filtered by query={raw_query!r}{scope_note}) ---")
     else:
         header_parts.append("--- Digest ---")
     header_text = "\n".join(header_parts)
 
-    parsed_query = _parse_step_query(raw_query) if has_query else None
     budget = max(1000, max_chars - len(header_text) - 220)
+    matched_generics = (
+        _find_matching_generic_steps(full_path, transcript_path, start_step, end_step, parsed_query)
+        if want_generic_search and parsed_query is not None
+        else None
+    )
+    if matched_generics:
+        for g_idx in matched_generics:
+            cinfo = generic_to_call.get(g_idx)
+            if cinfo and cinfo[3]:
+                need_full.add(cinfo[0])
+
+    def _refresh_generic_call_summaries(full_lists: dict[int, list[dict[str, Any]]]) -> None:
+        if not matched_generics:
+            return
+        for g_idx in matched_generics:
+            cinfo = generic_to_call.get(g_idx)
+            if not cinfo or not cinfo[3]:
+                continue
+            p_idx, call_pos, _, _ = cinfo
+            if p_idx not in full_lists:
+                continue
+            stub = {"step_index": p_idx, "type": "PLANNER_RESPONSE", "created_at": planner_created.get(p_idx, "")}
+            full_parent = _resolve_full_step(stub, full_lists)
+            ptcalls = full_parent.get("tool_calls") or []
+            if call_pos < len(ptcalls):
+                generic_to_call[g_idx] = (p_idx, call_pos, summarize_tool_call(ptcalls[call_pos]), False)
 
     def _render_window(
         window_steps: list[dict[str, Any]],
         full_lists: dict[int, list[dict[str, Any]]],
     ) -> list[tuple[int, str]]:
+        _refresh_generic_call_summaries(full_lists)
         out: list[tuple[int, str]] = []
-        ask_pending = False
         for obj in window_steps:
             idx = obj.get("step_index", 0)
             if idx in full_lists:
                 obj = _resolve_full_step(obj, full_lists)
-            block, ask_pending = _render_digest_step(
+            block = _render_digest_step(
                 obj,
                 include_tools=include_tools,
-                include_thinking=include_thinking,
+                thinking_mode=thinking_mode,
                 include_system=include_system,
                 has_query=has_query,
                 raw_query=raw_query,
                 parsed_query=parsed_query,
                 planner_result_steps=planner_result_steps,
                 result_step_subagent=result_step_subagent,
-                ask_question_pending=ask_pending,
+                result_step_error=result_step_error,
+                ask_question_result_steps=ask_question_result_steps,
+                matched_generics=matched_generics,
+                generic_to_call=generic_to_call,
             )
             if block is not None:
                 out.append((idx, block))
@@ -1175,37 +1460,28 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         target_est = budget + 4000
         for pos in range(len(steps) - 1, -1, -1):
             obj = steps[pos]
-            if obj.get("type") == "GENERIC":
+            if obj.get("type") == "GENERIC" and (obj.get("step_index", 0), obj.get("created_at") or "") not in ask_question_result_steps:
                 continue
-            block, _ = _render_digest_step(
+            block = _render_digest_step(
                 obj,
                 include_tools=include_tools,
-                include_thinking=include_thinking,
+                thinking_mode=thinking_mode,
                 include_system=include_system,
                 has_query=False,
                 raw_query="",
                 parsed_query=None,
                 planner_result_steps=planner_result_steps,
                 result_step_subagent=result_step_subagent,
-                ask_question_pending=False,
+                result_step_error=result_step_error,
+                ask_question_result_steps=ask_question_result_steps,
+                matched_generics=None,
+                generic_to_call=None,
             )
             if block is not None:
                 est_used += len(block) + 1
                 est_kept += 1
                 if est_kept >= 2 and est_used > target_est:
                     tail_start = pos
-                    break
-        if tail_start > 0:
-            for prev_pos in range(tail_start - 1, -1, -1):
-                prev = steps[prev_pos]
-                ptype = prev.get("type")
-                if ptype in ("USER_INPUT", "GENERIC"):
-                    break
-                if ptype == "PLANNER_RESPONSE":
-                    ptcalls = prev.get("tool_calls") or []
-                    ptrunc = prev.get("truncated_fields") or ()
-                    if any(tc.get("name") == "ask_question" for tc in ptcalls) or "tool_calls" in ptrunc:
-                        tail_start = prev_pos
                     break
 
     window_steps = steps[tail_start:] if tail_start > 0 else steps
@@ -1220,7 +1496,8 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             rendered_steps = _render_window(steps, full_lists)
 
     if has_query and not rendered_steps:
-        return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_step or (max_file_idx or 0)}."
+        end_disp = end_step if end_step is not None else (max_file_idx or 0)
+        return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_disp}."
 
     body_text = "\n".join(block for _, block in rendered_steps)
     if len(header_text) + 1 + len(body_text) <= max_chars or not rendered_steps:
@@ -1236,10 +1513,13 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             used += len(item[1]) + 1
         last_kept = kept[-1][0]
         kept_body = "\n".join(block for _, block in kept)
+        if len(kept) >= len(rendered_steps):
+            return f"{header_text}\n{kept_body}"
+        kind_label = "matching steps" if has_query else "steps"
         return (
             f"{header_text}\n{kept_body}\n\n"
-            f"... [Digest capped at {max_chars} chars (showing steps {kept[0][0]}..{last_kept}); "
-            f"pass start_step={last_kept + 1} to continue]"
+            f"... [Digest capped at {max_chars} chars (showing {len(kept)}/{len(rendered_steps)} {kind_label}, "
+            f"steps {kept[0][0]}..{last_kept}); pass start_step={last_kept + 1} to continue]"
         )
     else:
         kept_rev: list[tuple[int, str]] = []
@@ -1515,7 +1795,7 @@ TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Keywords or phrase to search for (use '|' to separate OR alternatives).",
+                    "description": "Keywords or phrases to search for (use '|' to separate OR phrase alternatives; without '|', space-separated tokens are ANDed).",
                 },
                 "workspace": {
                     "type": "string",
@@ -1545,15 +1825,19 @@ TOOLS = [
                 },
                 "query": {
                     "type": "string",
-                    "description": "Optional keyword filter (supports space-separated AND tokens or '|'-separated OR alternatives). Searches across content, thinking, and tool_calls (restoring from transcript_full.jsonl) and returns only matching steps.",
+                    "description": "Optional keyword filter (supports space-separated AND tokens or '|'-separated OR phrase alternatives). Searches content, tool_calls, thinking (unless include_thinking=false), and tool outputs (when include_tool_outputs=true).",
                 },
                 "include_tools": {
                     "type": "boolean",
-                    "description": "Include compact one-line summaries of tool calls with their result step_index and inner MCP arguments (default true).",
+                    "description": "Include compact one-line summaries of tool calls with their result step_index, failure tags (e.g. exit=1), and inner MCP arguments (default true).",
                 },
                 "include_thinking": {
                     "type": "boolean",
-                    "description": "Include full model internal thinking blocks restored from transcript_full.jsonl (default false; auto-enabled on steps where thinking matches query).",
+                    "description": "Control model internal thinking blocks: omit (default) to auto-attach a compact snippet only when a step matches query solely via thinking; set false to exclude thinking from both search and output; set true for full thinking blocks.",
+                },
+                "include_tool_outputs": {
+                    "type": "boolean",
+                    "description": "When paired with query, also search raw GENERIC tool outputs (streaming transcript_full.jsonl) and render compact match windows with calling context (default false).",
                 },
                 "include_system_messages": {
                     "type": "boolean",
