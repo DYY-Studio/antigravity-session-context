@@ -2,7 +2,7 @@
   "name": "session-context",
   "displayName": "Session Context",
   "description": "Cross-conversation context lookup, token budget inspector, and digest MCP server: inspect exact context/compaction budgets (including subagents), list, search, and read distilled summaries or steps from conversations.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Check the context window and 256k compaction budget of this conversation and its subagents",

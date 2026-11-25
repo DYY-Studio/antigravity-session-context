@@ -44,6 +44,9 @@ _CONTENT_READ_TOOLS = frozenset(
 )
 
 _CACHE_LIMIT = 512
+_DEFAULT_INLINE_MAX_CHARS = 8000
+_DEFAULT_INLINE_MAX_BYTES = 9200
+_STEP_TRUNC_NOTE_RESERVE = 130
 _DB_CTX_CACHE: dict[tuple[Any, ...], dict[str, Any] | None] = {}
 _METRICS_CACHE: dict[tuple[str, int, int], dict[str, Any]] = {}
 _SUBAGENT_MAP_CACHE: dict[tuple[str, int, int], dict[str, dict[str, Any]]] = {}
@@ -784,11 +787,70 @@ def find_matching_steps(cid: str, raw_query: str, max_shown: int = 12) -> str:
     return f"[{shown}]"
 
 
+def _resolve_budget(
+    args: dict[str, Any],
+    *,
+    min_chars: int = 500,
+    max_cap: int = 100000,
+) -> tuple[int, int | None]:
+    """Return (max_chars, max_bytes_or_None). Omitting max_chars enables inline-safe UTF-8 byte cap."""
+    raw = get_arg(args, "max_chars", "maxChars")
+    if raw is None:
+        return _DEFAULT_INLINE_MAX_CHARS, _DEFAULT_INLINE_MAX_BYTES
+    return max(min_chars, min(int(raw), max_cap)), None
+
+
+def _fit_prefix_len(text: str, max_chars: int, max_bytes: int | None) -> int:
+    """Return the largest char prefix length <= max_chars whose UTF-8 size is <= max_bytes."""
+    limit = min(len(text), max(0, max_chars))
+    if max_bytes is None or limit == 0:
+        return limit
+    cand = text[:limit]
+    if len(cand.encode("utf-8")) <= max_bytes:
+        return limit
+    return len(cand.encode("utf-8")[: max(0, max_bytes)].decode("utf-8", errors="ignore"))
+
+
+def _fits_budget(text: str, max_chars: int, max_bytes: int | None) -> bool:
+    if len(text) > max_chars:
+        return False
+    if max_bytes is not None and len(text.encode("utf-8")) > max_bytes:
+        return False
+    return True
+
+
+def _waterfill_alloc(sizes: list[int], total_budget: int, note_reserve: int) -> list[int | None]:
+    """Fairly allocate total_budget across items: None means keep whole, int means truncate to that size."""
+    n = len(sizes)
+    alloc: list[int | None] = [None] * n
+    remaining = list(range(n))
+    rem_budget = max(0, total_budget)
+    while remaining:
+        if sum(sizes[i] for i in remaining) <= rem_budget:
+            break
+        k = len(remaining)
+        slot = max(0, rem_budget // k)
+        small = [i for i in remaining if sizes[i] <= slot]
+        if small:
+            small_set = set(small)
+            for i in small:
+                rem_budget -= sizes[i]
+            remaining = [i for i in remaining if i not in small_set]
+            continue
+        avail = max(0, rem_budget - k * note_reserve)
+        base, extra = divmod(avail, k)
+        for pos, i in enumerate(remaining):
+            alloc[i] = base + (1 if pos < extra else 0)
+        break
+    return alloc
+
+
 def tool_search_conversations(args: dict[str, Any]) -> str:
     raw_query = str(get_arg(args, "query", default="") or "").strip()
     workspace = str(get_arg(args, "workspace", default="") or "").strip()
     parent_id = str(get_arg(args, "parent_conversation_id", "parentConversationId", default="") or "").strip()
     limit = max(1, min(int(get_arg(args, "limit", default=10)), 50))
+    max_chars, max_bytes = _resolve_budget(args, min_chars=500)
     fts_query = build_fts_query(raw_query)
 
     with open_summaries_db() as conn:
@@ -837,8 +899,10 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         for label, snip in (("user", r["user_snip"]), ("agent", r["agent_snip"])):
             cleaned = re.sub(r"\s+", " ", (snip or "").strip())
             if cleaned and "[" in cleaned and "]" in cleaned:
+                if len(cleaned) > 180:
+                    cleaned = cleaned[:177].rstrip() + "..."
                 entry = f"[{label}] {cleaned}"
-                if entry not in grouped[cid]["snippets"] and len(grouped[cid]["snippets"]) < 3:
+                if entry not in grouped[cid]["snippets"] and len(grouped[cid]["snippets"]) < 2:
                     grouped[cid]["snippets"].append(entry)
 
     for fr in fallback_rows:
@@ -853,7 +917,9 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         return f"No conversations matched query: {raw_query!r}"
 
     parent_role_cache: dict[str, dict[str, dict[str, Any]]] = {}
-    lines = [f"Matched {len(grouped)} conversation(s) for {raw_query!r}:"]
+    query_disp = _clean_scalar(raw_query, 120)
+    header = f"Matched {len(grouped)} conversation(s) for {query_disp!r}:"
+    entries: list[str] = []
     for cid, info in grouped.items():
         r = info["meta"]
         parent_cid = r["parent_conversation_id"] or ""
@@ -870,14 +936,54 @@ def tool_search_conversations(args: dict[str, Any]) -> str:
         parent_tag = f" | parent={parent_cid}" if parent_cid else ""
         step_hits = info.get("precomputed_hits") or find_matching_steps(cid, raw_query)
         step_hits_line = f"\n  matched_steps: {step_hits}" if step_hits else ""
-        lines.append(
+        item_lines = [
             f"- {cid} | {compact_ts(r['last_modified_time'])} | steps={r['step_count']}{parent_tag}\n"
             f"  title: {title}\n"
             f"  workspace: {ws}{step_hits_line}"
-        )
+        ]
         for s in info["snippets"]:
-            lines.append(f"  match: {s}")
-    return "\n".join(lines)
+            item_lines.append(f"  match: {s}")
+        entries.append("\n".join(item_lines))
+
+    full_text = "\n".join([header, *entries])
+    if _fits_budget(full_text, max_chars, max_bytes):
+        return full_text
+
+    footer_reserve = 160
+    kept_entries: list[str] = []
+    first_truncated = False
+    used_chars = len(header)
+    used_bytes = len(header.encode("utf-8"))
+    char_limit = max(0, max_chars - footer_reserve)
+    byte_limit = max(0, max_bytes - footer_reserve) if max_bytes is not None else None
+    for entry in entries:
+        add_chars = 1 + len(entry)
+        add_bytes = 1 + len(entry.encode("utf-8"))
+        exceeds = (
+            used_chars + add_chars > char_limit
+            or (byte_limit is not None and used_bytes + add_bytes > byte_limit)
+        )
+        if exceeds:
+            if not kept_entries:
+                rem_c = max(0, char_limit - used_chars - 4)
+                rem_b = max(0, byte_limit - used_bytes - 4) if byte_limit is not None else None
+                take = _fit_prefix_len(entry, rem_c, rem_b)
+                if take > 0:
+                    kept_entries.append(entry[:take].rstrip() + "...")
+                first_truncated = True
+            break
+        kept_entries.append(entry)
+        used_chars += add_chars
+        used_bytes += add_bytes
+
+    body = "\n".join([header, *kept_entries])
+    if len(kept_entries) < len(entries) or first_truncated:
+        return (
+            f"{body}\n\n"
+            f"... [Search output capped (showing {len(kept_entries)}/{len(entries)} matched conversations); "
+            f"narrow query/workspace, lower limit, or pass larger max_chars]"
+        )
+    return body
 
 
 def _load_full_steps_all(full_path: Path, step_indices: set[int]) -> dict[int, list[dict[str, Any]]]:
@@ -1129,7 +1235,7 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     has_explicit_start = raw_start is not None or has_query
     start_step = int(raw_start) if raw_start is not None else 0
     end_step = int(raw_end) if raw_end is not None else None
-    max_chars = max(2000, min(int(get_arg(args, "max_chars", "maxChars", default=24000)), 100000))
+    max_chars, max_bytes = _resolve_budget(args, min_chars=2000)
 
     brain_dir = app_data_dir() / "brain" / cid
     logs_dir = brain_dir / ".system_generated" / "logs"
@@ -1397,6 +1503,11 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     header_text = "\n".join(header_parts)
 
     budget = max(1000, max_chars - len(header_text) - 220)
+    byte_budget = (
+        max(1000, max_bytes - len(header_text.encode("utf-8")) - 240)
+        if max_bytes is not None
+        else None
+    )
     matched_generics = (
         _find_matching_generic_steps(full_path, transcript_path, start_step, end_step, parsed_query)
         if want_generic_search and parsed_query is not None
@@ -1456,8 +1567,10 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     tail_start = 0
     if not has_explicit_start and len(steps) > 40:
         est_used = 0
+        est_used_bytes = 0
         est_kept = 0
         target_est = budget + 4000
+        target_est_bytes = (byte_budget + 4000) if byte_budget is not None else None
         for pos in range(len(steps) - 1, -1, -1):
             obj = steps[pos]
             if obj.get("type") == "GENERIC" and (obj.get("step_index", 0), obj.get("created_at") or "") not in ask_question_result_steps:
@@ -1479,8 +1592,12 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
             )
             if block is not None:
                 est_used += len(block) + 1
+                est_used_bytes += len(block.encode("utf-8")) + 1
                 est_kept += 1
-                if est_kept >= 2 and est_used > target_est:
+                if est_kept >= 2 and (
+                    est_used > target_est
+                    or (target_est_bytes is not None and est_used_bytes > target_est_bytes)
+                ):
                     tail_start = pos
                     break
 
@@ -1490,27 +1607,44 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
     rendered_steps = _render_window(window_steps, full_lists)
 
     if tail_start > 0:
-        tail_body_len = sum(len(b) for _, b in rendered_steps) + max(0, len(rendered_steps) - 1)
-        if len(header_text) + 1 + tail_body_len <= max_chars or (tail_body_len + 1) <= budget:
+        tail_body = "\n".join(b for _, b in rendered_steps)
+        tail_body_len = len(tail_body)
+        tail_body_bytes = len(tail_body.encode("utf-8"))
+        fits_char = len(header_text) + 1 + tail_body_len <= max_chars or (tail_body_len + 1) <= budget
+        fits_byte = byte_budget is None or (
+            len(header_text.encode("utf-8")) + 1 + tail_body_bytes <= (max_bytes or 0)
+            or (tail_body_bytes + 1) <= byte_budget
+        )
+        if fits_char and fits_byte:
             full_lists = _load_full_steps_all(full_path, need_full)
             rendered_steps = _render_window(steps, full_lists)
+            tail_start = 0
 
     if has_query and not rendered_steps:
         end_disp = end_step if end_step is not None else (max_file_idx or 0)
         return f"{header_text}\nNo steps matched query {raw_query!r} in range {start_step}..{end_disp}."
 
     body_text = "\n".join(block for _, block in rendered_steps)
-    if len(header_text) + 1 + len(body_text) <= max_chars or not rendered_steps:
-        return f"{header_text}\n{body_text}" if body_text else header_text
+    full_digest = f"{header_text}\n{body_text}" if body_text else header_text
+    if not rendered_steps or _fits_budget(full_digest, max_chars, max_bytes):
+        return full_digest
 
+    cap_label = f"{max_chars} chars / {max_bytes} bytes" if max_bytes is not None else f"{max_chars} chars"
     if has_explicit_start:
         kept: list[tuple[int, str]] = []
         used = 0
+        used_bytes = 0
         for item in rendered_steps:
-            if kept and used + len(item[1]) + 1 > budget:
+            add_c = len(item[1]) + 1
+            add_b = len(item[1].encode("utf-8")) + 1
+            if kept and (
+                used + add_c > budget
+                or (byte_budget is not None and used_bytes + add_b > byte_budget)
+            ):
                 break
             kept.append(item)
-            used += len(item[1]) + 1
+            used += add_c
+            used_bytes += add_b
         last_kept = kept[-1][0]
         kept_body = "\n".join(block for _, block in kept)
         if len(kept) >= len(rendered_steps):
@@ -1518,24 +1652,33 @@ def tool_get_conversation_digest(args: dict[str, Any]) -> str:
         kind_label = "matching steps" if has_query else "steps"
         return (
             f"{header_text}\n{kept_body}\n\n"
-            f"... [Digest capped at {max_chars} chars (showing {len(kept)}/{len(rendered_steps)} {kind_label}, "
+            f"... [Digest capped at {cap_label} (showing {len(kept)}/{len(rendered_steps)} {kind_label}, "
             f"steps {kept[0][0]}..{last_kept}); pass start_step={last_kept + 1} to continue]"
         )
     else:
         kept_rev: list[tuple[int, str]] = []
         used = 0
+        used_bytes = 0
         for item in reversed(rendered_steps):
-            if kept_rev and used + len(item[1]) + 1 > budget:
+            add_c = len(item[1]) + 1
+            add_b = len(item[1].encode("utf-8")) + 1
+            if kept_rev and (
+                used + add_c > budget
+                or (byte_budget is not None and used_bytes + add_b > byte_budget)
+            ):
                 break
             kept_rev.append(item)
-            used += len(item[1]) + 1
+            used += add_c
+            used_bytes += add_b
         kept = list(reversed(kept_rev))
         first_kept = kept[0][0]
         last_kept = kept[-1][0]
         kept_body = "\n".join(block for _, block in kept)
+        if len(kept) >= len(rendered_steps) and tail_start == 0:
+            return f"{header_text}\n{kept_body}"
         banner = (
             f"\n[Showing most recent steps {first_kept}..{last_kept} of {min_file_idx or 0}..{max_file_idx or 0} "
-            f"(digest capped at {max_chars} chars); pass start_step=0, end_step={max(0, first_kept - 1)} to inspect earlier steps]"
+            f"(digest capped at {cap_label}); pass start_step=0, end_step={max(0, first_kept - 1)} to inspect earlier steps]"
         )
         return f"{header_text}{banner}\n{kept_body}"
 
@@ -1558,7 +1701,7 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
 
     use_full = bool(get_arg(args, "full", default=False))
     offset = max(0, int(get_arg(args, "offset", default=0)))
-    max_chars = max(500, min(int(get_arg(args, "max_chars", "maxChars", default=16000)), 100000))
+    max_chars, max_bytes = _resolve_budget(args, min_chars=500)
 
     logs_dir = app_data_dir() / "brain" / cid / ".system_generated" / "logs"
     transcript_path = logs_dir / "transcript.jsonl"
@@ -1594,10 +1737,10 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
     }
     upgraded_lists = _load_full_steps_all(full_path, need_upgrade) if need_upgrade else {}
 
-    blocks: list[str] = []
+    blocks: list[tuple[int, str]] = []
     for idx in target_list:
         if idx not in found_map:
-            blocks.append(f"Source: {chosen_path.name} | step_index={idx} | NOT FOUND")
+            blocks.append((idx, f"Source: {chosen_path.name} | step_index={idx} | NOT FOUND"))
             continue
         base_obj = found_map[idx]
         if idx in upgraded_lists:
@@ -1607,14 +1750,88 @@ def tool_get_conversation_step(args: dict[str, Any]) -> str:
             obj = base_obj
             src_note = chosen_path.name
         formatted = json.dumps(obj, ensure_ascii=False, indent=2)
-        blocks.append(f"Source: {src_note} | step_index={idx} | chars={len(formatted)}\n{formatted}")
+        blocks.append((idx, f"Source: {src_note} | step_index={idx} | chars={len(formatted)}\n{formatted}"))
 
-    combined = "\n\n".join(blocks)
+    combined = "\n\n".join(b for _, b in blocks)
+    if offset == 0 and _fits_budget(combined, max_chars, max_bytes):
+        return combined
+
+    if len(blocks) > 1 and offset == 0:
+        sep_cost = 2 * (len(blocks) - 1)
+        byte_sizes = [len(b.encode("utf-8")) for _, b in blocks]
+        byte_alloc = (
+            _waterfill_alloc(byte_sizes, max(0, max_bytes - sep_cost), _STEP_TRUNC_NOTE_RESERVE)
+            if max_bytes is not None
+            else [None] * len(blocks)
+        )
+        cap_chars: list[int] = []
+        pre_chars: list[int] = []
+        for i, (_, block) in enumerate(blocks):
+            if byte_alloc[i] is not None:
+                c_cap = _fit_prefix_len(block, len(block), byte_alloc[i])
+                cap_chars.append(c_cap)
+                pre_chars.append(c_cap + _STEP_TRUNC_NOTE_RESERVE)
+            else:
+                cap_chars.append(len(block))
+                pre_chars.append(len(block))
+        char_alloc = _waterfill_alloc(pre_chars, max(0, max_chars - sep_cost), _STEP_TRUNC_NOTE_RESERVE)
+
+        takes: list[int] = []
+        trunc_takes: list[int] = []
+        for i, (_, block) in enumerate(blocks):
+            if byte_alloc[i] is None and char_alloc[i] is None:
+                takes.append(len(block))
+            else:
+                take = min(cap_chars[i], char_alloc[i]) if char_alloc[i] is not None else cap_chars[i]
+                takes.append(take)
+                if take < len(block):
+                    trunc_takes.append(take)
+
+        if trunc_takes and min(trunc_takes) < 120:
+            header_lines = [b.split("\n", 1)[0] for _, b in blocks]
+            footer = (
+                f"\n... [Too many steps ({len(blocks)}) to preview within budget; "
+                f"call get_conversation_step in smaller batches or pass a single step_index]"
+            )
+            rem_c = max(100, max_chars - len(footer) - 4)
+            rem_b = max(100, max_bytes - len(footer) - 4) if max_bytes is not None else None
+            idx_text = "\n".join(header_lines)
+            take = _fit_prefix_len(idx_text, rem_c, rem_b)
+            if take < len(idx_text):
+                idx_text = idx_text[:take].rstrip() + "..."
+            return f"{idx_text}{footer}"
+
+        full_hint = ", full=true" if use_full else ""
+        out_blocks: list[str] = []
+        for i, (idx, block) in enumerate(blocks):
+            take = takes[i]
+            if take < len(block):
+                note = (
+                    f"\n... [step {idx} truncated at {take}/{len(block)} chars; "
+                    f"call with step_index={idx}, offset={take}{full_hint} to read more]"
+                )
+                out_blocks.append(f"{block[:take]}{note}")
+            else:
+                out_blocks.append(block)
+        return "\n\n".join(out_blocks)
+
     total_len = len(combined)
-    sliced = combined[offset : offset + max_chars]
+    tail = combined[offset:]
+    if _fits_budget(tail, max_chars, max_bytes):
+        return tail
+    note_reserve = 110
+    take = _fit_prefix_len(
+        tail,
+        max(1, max_chars - (note_reserve if max_bytes is not None else 0)),
+        max(1, max_bytes - note_reserve) if max_bytes is not None else None,
+    )
+    sliced = tail[:take]
     more_note = ""
-    if offset + max_chars < total_len:
-        more_note = f"\n... [truncated at {offset + max_chars}/{total_len} chars; pass offset={offset + max_chars} to read more]"
+    if offset + take < total_len:
+        more_note = (
+            f"\n... [truncated at {offset + take}/{total_len} chars; "
+            f"pass offset={offset + take} to read more]"
+        )
     return f"{sliced}{more_note}"
 
 
@@ -1809,6 +2026,10 @@ TOOLS = [
                     "type": "integer",
                     "description": "Maximum number of matching conversations to return (default 10, max 50).",
                 },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum characters to return (default 8000 inline-safe, max 100000).",
+                },
             },
             "required": ["query"],
         },
@@ -1857,7 +2078,7 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters to return (default 24000, max 100000). When start_step and query are omitted and the digest exceeds max_chars, the most recent steps within budget are returned.",
+                    "description": "Maximum characters to return (default 8000 inline-safe, max 100000). When start_step and query are omitted and the digest exceeds budget, the most recent steps within budget are returned.",
                 },
             },
             "required": ["conversation_id"],
@@ -1892,7 +2113,7 @@ TOOLS = [
                 },
                 "max_chars": {
                     "type": "integer",
-                    "description": "Maximum characters to return (default 16000, max 100000).",
+                    "description": "Maximum characters to return (default 8000 inline-safe, max 100000). Multi-step batches at offset=0 fairly allocate budget across steps so short steps stay intact.",
                 },
             },
             "required": ["conversation_id"],
@@ -1947,7 +2168,7 @@ def handle_request(msg: dict[str, Any]) -> dict[str, Any] | None:
             "result": {
                 "protocolVersion": client_version,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "session-context", "version": "1.2.0"},
+                "serverInfo": {"name": "session-context", "version": "1.3.0"},
             },
         }
 
